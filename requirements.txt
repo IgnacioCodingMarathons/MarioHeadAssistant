@@ -1,0 +1,3 @@
+pygame==2.6.1
+PySide6>=6.12.0
+screen-brightness-control; sys_platform == "win32"
