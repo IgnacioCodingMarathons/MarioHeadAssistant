@@ -8,6 +8,7 @@ DEFAULT_SETTINGS = {
     'use_entropy_for_position': False,
     'zen_mode': False,
     'super_zen_mode': False,
+    'oh_sorry': True,
 }
 
 
@@ -32,8 +33,9 @@ def create_settings_window(QtCore, QtWidgets, values, changed):
     layout.addWidget(tabs)
     controls = {}
     for title, sliders, checks in (
-        ('Communication', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness')],
-         [('Zen Mode', 'zen_mode'), ('Super Zen Mode', 'super_zen_mode')]),
+        ('Conversation', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness')],
+         [('Zen Mode', 'zen_mode'), ('Super Zen Mode', 'super_zen_mode'),
+          ('"Oh, sorry!"', 'oh_sorry')]),
         ('Movement', [('Wandering', 'wandering')],
          [('Use entropy for position', 'use_entropy_for_position')]),
     ):

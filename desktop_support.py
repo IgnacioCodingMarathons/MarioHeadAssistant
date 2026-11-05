@@ -37,8 +37,8 @@ class DesktopNotifications:
         self.tray.show()
         self.QtWidgets = QtWidgets
 
-    def show(self):
-        self.tray.showMessage('Hey!', 'I got something in my eye, can you help me get it out?',
+    def show(self, title='Hey!', body='I got something in my eye, can you help me get it out?'):
+        self.tray.showMessage(title, body,
                               self.QtWidgets.QSystemTrayIcon.MessageIcon.Information, 60000)
         return self
 

@@ -41,7 +41,7 @@ def set_brightness(executable, values):
 def play_tunnel_of_doom(
     assets, ffmpeg, temp_dir, window, renderer, texture, qt_app, Gtk,
     start_decoder, stop_decoder, decode_first_frame, decode_last_frame,
-    video_size, video_fps,
+    video_size, video_fps, on_drop=None,
 ):
     from desktop_support import BrightnessController
     brightness = BrightnessController(qt_app)
@@ -79,6 +79,8 @@ def play_tunnel_of_doom(
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return 'quit'
+            if event.type == pygame.DROPFILE and on_drop is not None:
+                on_drop(event.file, pygame.mouse.get_pos()[0])
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return 'cancel'
