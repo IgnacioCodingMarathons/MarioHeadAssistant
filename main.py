@@ -838,7 +838,6 @@ def main() -> None:
         voice_processing = False
         voice_animation_deadline = 0.0
         voice_animation_done = False
-        voice_pending_result = None
         voice_keys_down = set()
         voice_control_keys = {pygame.K_LCTRL, pygame.K_RCTRL}
         voice_shift_keys = {pygame.K_LSHIFT, pygame.K_RSHIFT}
@@ -1051,7 +1050,6 @@ def main() -> None:
                     elif voice_state["samples"] is not None:
                         voice_processing = True
                         voice_animation_done = False
-                        voice_pending_result = None
                         audio.stop()
                         if pet_video is not None:
                             finish_pet_alert()
@@ -1103,7 +1101,29 @@ def main() -> None:
                 pass
             else:
                 if voice_processing:
-                    voice_pending_result = (transcript, voice_error)
+                    voice_processing = False
+                    audio.stop()
+                    if not finished:
+                        stop_decoder(process, stop, reader)
+                    finished = True
+                    frame_surface = greeting_first_surface
+                    last_frame_surface = greeting_first_surface
+                    frame_dirty = True
+                    video = ASSETS / "greeting.avi"
+                    if voice_error is not None:
+                        print(
+                            f"MarioAssistant voice: request failed: "
+                            f"{type(voice_error).__name__}: {voice_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        menu_action[0] = "voice_apology"
+                    else:
+                        voice_action = interpret_voice_command(transcript)
+                        if voice_action in ("tunnel", "eye"):
+                            minigame_action[0] = voice_action
+                        else:
+                            menu_action[0] = voice_action or "voice_apology"
                 else:
                     if voice_error is not None:
                         print(
@@ -1127,32 +1147,6 @@ def main() -> None:
                 if frame_surface is not None:
                     last_frame_surface = frame_surface
                 voice_animation_done = True
-            if voice_processing and voice_animation_done and voice_pending_result is not None:
-                voice_processing = False
-                transcript, voice_error = voice_pending_result
-                voice_pending_result = None
-                audio.stop()
-                if not finished:
-                    stop_decoder(process, stop, reader)
-                finished = True
-                frame_surface = greeting_first_surface
-                last_frame_surface = greeting_first_surface
-                frame_dirty = True
-                video = ASSETS / "greeting.avi"
-                if voice_error is not None:
-                    print(
-                        f"MarioAssistant voice: request failed: "
-                        f"{type(voice_error).__name__}: {voice_error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    menu_action[0] = "voice_apology"
-                else:
-                    voice_action = interpret_voice_command(transcript)
-                    if voice_action in ("tunnel", "eye"):
-                        minigame_action[0] = voice_action
-                    else:
-                        menu_action[0] = voice_action or "voice_apology"
             if pet.tick():
                 disappointment_sound.play()
                 for need_name in tuple(pet_notifications):
