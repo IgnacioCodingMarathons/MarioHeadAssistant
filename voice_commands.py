@@ -354,7 +354,13 @@ def interpret_voice_command(transcript):
             return "quench_thirst"
     if "move" in words or contains("out of the way") or contains("out of my way"):
         return "move"
-    if "play" in words and "random" in words and ("minigame" in words or "minigames" in words):
+    has_minigame = (
+        "minigame" in words
+        or "minigames" in words
+        or ("mini" in words and "game" in words)
+        or ("mini" in words and "games" in words)
+    )
+    if "play" in words and "random" in words and has_minigame:
         return "random_minigame"
     if (
         "minigames" in words
