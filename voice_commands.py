@@ -1,10 +1,11 @@
 import json
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 
-from pygame._sdl2 import AUDIO_S16, AudioDevice
+from pygame._sdl2 import AUDIO_S16, AudioDevice, get_audio_device_names
 
 
 SAMPLE_RATE = 16000
@@ -28,11 +29,14 @@ def create_beep_sound(pygame):
 
 class MicrophoneCapture:
     def __init__(self):
+        devices = get_audio_device_names(iscapture=True)
+        if not devices:
+            raise RuntimeError("No microphone input device is available")
         self.samples = bytearray()
         self.lock = threading.Lock()
         self.accepting = True
         self.device = AudioDevice(
-            devicename=None,
+            devicename=devices[0],
             iscapture=True,
             frequency=SAMPLE_RATE,
             audioformat=AUDIO_S16,
@@ -68,17 +72,19 @@ class SpeechTranscriber:
         )
         self.model = None
         self.vosk_unavailable = False
+        self.last_engine = None
         self.lock = threading.Lock()
 
     def transcribe(self, samples):
         if not samples:
             raise ValueError("No speech was captured")
+        self.last_engine = None
         if not self.vosk_unavailable:
             try:
+                import vosk
+
                 with self.lock:
                     if self.model is None:
-                        import vosk
-
                         vosk.SetLogLevel(-1)
                         self.model = vosk.Model(str(self.model_path))
                     recognizer = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
@@ -86,17 +92,43 @@ class SpeechTranscriber:
                 transcript = json.loads(recognizer.FinalResult()).get("text", "").strip()
                 if not transcript:
                     raise ValueError("Vosk did not recognize speech")
+                self.last_engine = "vosk"
                 return transcript
-            except Exception:
+            except Exception as exc:
                 self.vosk_unavailable = True
-        import speech_recognition as sr
+                print(
+                    f"MarioAssistant voice: Vosk failed using {self.model_path}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return self.transcribe_google(samples)
 
-        recognizer = sr.Recognizer()
-        audio = sr.AudioData(samples, SAMPLE_RATE, 2)
-        transcript = recognizer.recognize_google(audio, language="en-US").strip()
-        if not transcript:
-            raise ValueError("Google recognition returned no speech")
-        return transcript
+    def transcribe_google(self, samples):
+        try:
+            import speech_recognition as sr
+
+            recognizer = sr.Recognizer()
+            recognizer.operation_timeout = 10
+            audio = sr.AudioData(samples, SAMPLE_RATE, 2)
+            print(
+                "MarioAssistant voice: trying Google SpeechRecognition fallback",
+                file=sys.stderr,
+                flush=True,
+            )
+            transcript = recognizer.recognize_google(audio, language="en-US").strip()
+            if not transcript:
+                raise ValueError("Google recognition returned no speech")
+            self.last_engine = "google"
+            return transcript
+        except Exception as exc:
+            print(
+                f"MarioAssistant voice: Google SpeechRecognition failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
 
 
 def interpret_voice_command(transcript):
@@ -112,6 +144,13 @@ def interpret_voice_command(transcript):
         return "stop"
     if contains("goodbye"):
         return "goodbye"
+    if "speak" in words or contains("say something"):
+        return "speak"
+    if "quench" in words:
+        if "hunger" in words and "thirst" not in words:
+            return "quench_hunger"
+        if "thirst" in words and "hunger" not in words:
+            return "quench_thirst"
     if "move" in words or contains("out of the way") or contains("out of my way"):
         return "move"
     if (

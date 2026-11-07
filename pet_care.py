@@ -118,6 +118,9 @@ class PetNeeds:
         seconds_until_threshold = max(0, self.levels[name] - 50) / rate_per_second
         return self.last_tick + seconds_until_threshold + 1 / 60
 
+    def is_full(self, name):
+        return name in self.levels and self.levels[name] >= 99.9
+
     def remind(self, name, now=None):
         now = time.monotonic() if now is None else now
         self.requested = name
@@ -136,7 +139,7 @@ class PetNeeds:
             target = self.requested
             if target is None or not self.needy[target]:
                 target = min(self.levels, key=self.levels.get)
-        if self.levels[target] >= 99.9:
+        if self.is_full(target):
             return 'full'
         boost = 10 if steam_shortcut else size / 1_000_000 * 5
         self.levels[target] = min(100, self.levels[target] + boost)

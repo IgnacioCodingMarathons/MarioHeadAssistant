@@ -197,6 +197,9 @@ def create_context_menu(Gtk, menu_action, stop_only=False):
         ("Super Debug", "superdebug"),
         ("Pet Care", "petcare"),
         ("Settings", "settings"),
+        ("Speak", "speak"),
+        ("Quench hunger", "quench_hunger"),
+        ("Quench thirst", "quench_thirst"),
         ("Goodbye", "goodbye"),
     )
     for label, action in options:
@@ -373,7 +376,9 @@ def show_context_menu(Gtk, Gdk, menu_action, active_menu, stop_only=False):
         options = (("Stop", "stop"),) if stop_only else (
             ("Stop", "stop"), ("Move", "move"), ("IM Minigames", "minigames"),
             ("Super Debug", "superdebug"), ("Pet Care", "petcare"),
-            ("Settings", "settings"), ("Goodbye", "goodbye"),
+            ("Settings", "settings"), ("Speak", "speak"),
+            ("Quench hunger", "quench_hunger"),
+            ("Quench thirst", "quench_thirst"), ("Goodbye", "goodbye"),
         )
         for label, action in options:
             item = menu.addAction(label)
@@ -433,6 +438,9 @@ def create_tray_menu(QtWidgets, tray, menu_action, live_values):
         ("IM Minigames", "minigames"),
         ("Super Debug", "superdebug"),
         ("Settings", "settings"),
+        ("Speak", "speak"),
+        ("Quench hunger", "quench_hunger"),
+        ("Quench thirst", "quench_thirst"),
         ("Goodbye", "goodbye"),
     ):
         action = menu.addAction(label)
@@ -827,6 +835,10 @@ def main() -> None:
         voice_beep_channel = pygame.mixer.Channel(7)
         voice_transcriber = SpeechTranscriber(ASSETS)
         voice_results = queue.Queue()
+        voice_processing = False
+        voice_animation_deadline = 0.0
+        voice_animation_done = False
+        voice_pending_result = None
         voice_keys_down = set()
         voice_control_keys = {pygame.K_LCTRL, pygame.K_RCTRL}
         voice_shift_keys = {pygame.K_LSHIFT, pygame.K_RSHIFT}
@@ -866,9 +878,43 @@ def main() -> None:
                 voice_state["samples"] = None
             begin_voice_beeps("finishing")
 
+        def report_voice_transcript(engine, transcript):
+            action = interpret_voice_command(transcript)
+            engine_name = "Google" if engine == "google" else "Vosk"
+            if action is None:
+                result = "did not match a supported command"
+            else:
+                result = f"got it right: command {action!r}"
+            print(
+                f"MarioAssistant voice: {engine_name} {result}; "
+                f"transcript: {transcript!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return action
+
         def transcribe_voice(samples):
             try:
-                voice_results.put((voice_transcriber.transcribe(samples), None))
+                transcript = voice_transcriber.transcribe(samples)
+                engine = voice_transcriber.last_engine
+                action = report_voice_transcript(engine, transcript)
+                if engine == "vosk" and action is None:
+                    print(
+                        "MarioAssistant voice: trying Google SpeechRecognition "
+                        "because Vosk did not match a command",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    transcript = voice_transcriber.transcribe_google(samples)
+                    engine = voice_transcriber.last_engine
+                    action = report_voice_transcript(engine, transcript)
+                if action is None:
+                    print(
+                        "MarioAssistant voice: neither recognizer matched a supported command",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                voice_results.put((transcript, None))
             except Exception as exc:
                 voice_results.put((None, exc))
 
@@ -1003,6 +1049,47 @@ def main() -> None:
                     if voice_state["error"] is not None:
                         voice_results.put((None, voice_state["error"]))
                     elif voice_state["samples"] is not None:
+                        voice_processing = True
+                        voice_animation_done = False
+                        voice_pending_result = None
+                        audio.stop()
+                        if pet_video is not None:
+                            finish_pet_alert()
+                            pet_video = None
+                        if eye_event is not None:
+                            try:
+                                close_notification(Gio, GLib, eye_notification)
+                            except Exception as exc:
+                                print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                            eye_notification = None
+                            eye_event = None
+                            if not eye_manual:
+                                next_eye_at = time.monotonic() + random_delay(
+                                    preferences["playfulness"], 25, 75
+                                )
+                            eye_manual = False
+                        if idle_playing:
+                            idle_playing = False
+                            next_idle_at = time.monotonic() + idle_delay(
+                                preferences["chattiness"]
+                            )
+                        move_tween = None
+                        post_greeting_tween = None
+                        greeting_tween_started = True
+                        is_greeting = False
+                        (
+                            audio, frame_surface, last_frame_surface, process,
+                            frames, stop, reader,
+                        ) = start_media(
+                            ffmpeg, temp_dir, video_texture, process, stop, reader,
+                            ASSETS / "niceplace.avi",
+                        )
+                        video = ASSETS / "niceplace.avi"
+                        started = time.monotonic()
+                        consumed = 0
+                        finished = False
+                        frame_dirty = False
+                        voice_animation_deadline = started + 1.15
                         threading.Thread(
                             target=transcribe_voice,
                             args=(voice_state["samples"],),
@@ -1015,7 +1102,50 @@ def main() -> None:
             except queue.Empty:
                 pass
             else:
+                if voice_processing:
+                    voice_pending_result = (transcript, voice_error)
+                else:
+                    if voice_error is not None:
+                        print(
+                            f"MarioAssistant voice: request failed: "
+                            f"{type(voice_error).__name__}: {voice_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        menu_action[0] = "voice_apology"
+                    else:
+                        voice_action = interpret_voice_command(transcript)
+                        if voice_action in ("tunnel", "eye"):
+                            minigame_action[0] = voice_action
+                        else:
+                            menu_action[0] = voice_action or "voice_apology"
+            if voice_processing and not voice_animation_done and now >= voice_animation_deadline:
+                audio.stop()
+                if not finished:
+                    stop_decoder(process, stop, reader)
+                    finished = True
+                if frame_surface is not None:
+                    last_frame_surface = frame_surface
+                voice_animation_done = True
+            if voice_processing and voice_animation_done and voice_pending_result is not None:
+                voice_processing = False
+                transcript, voice_error = voice_pending_result
+                voice_pending_result = None
+                audio.stop()
+                if not finished:
+                    stop_decoder(process, stop, reader)
+                finished = True
+                frame_surface = greeting_first_surface
+                last_frame_surface = greeting_first_surface
+                frame_dirty = True
+                video = ASSETS / "greeting.avi"
                 if voice_error is not None:
+                    print(
+                        f"MarioAssistant voice: request failed: "
+                        f"{type(voice_error).__name__}: {voice_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     menu_action[0] = "voice_apology"
                 else:
                     voice_action = interpret_voice_command(transcript)
@@ -1347,6 +1477,53 @@ def main() -> None:
                 finished = False
                 frame_dirty = False
                 random_events_ready_at = time.monotonic() + 10
+            elif selected_action == "speak":
+                audio.stop()
+                if pet_video is not None:
+                    finish_pet_alert()
+                    pet_video = None
+                if eye_event is not None:
+                    try:
+                        close_notification(Gio, GLib, eye_notification)
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    eye_notification = None
+                    eye_event = None
+                    eye_manual = False
+                idle_video = random.choice(IDLE_VIDEOS)
+                (
+                    audio, frame_surface, last_frame_surface, process,
+                    frames, stop, reader,
+                ) = start_media(
+                    ffmpeg, temp_dir, video_texture, process, stop, reader,
+                    idle_video,
+                )
+                video = idle_video
+                started = time.monotonic()
+                consumed = 0
+                finished = False
+                frame_dirty = False
+                idle_playing = True
+                post_greeting_tween = None
+                move_tween = None
+                greeting_tween_started = True
+                is_greeting = False
+            elif selected_action in ("quench_hunger", "quench_thirst"):
+                target_need = "hunger" if selected_action == "quench_hunger" else "thirst"
+                levels = pet.snapshot()
+                if pet.is_full(target_need):
+                    show_full_meter_message(
+                        target_need, levels["hunger"], levels["thirst"]
+                    )
+                else:
+                    title = "Choose food for Mario" if target_need == "hunger" else "Choose drinks for Mario"
+                    selected_files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                        None, title, "", "All files (*)"
+                    )
+                    pet_drops.extend(
+                        (selected_file, target_need)
+                        for selected_file in selected_files
+                    )
             elif selected_action == "goodbye" and not goodbye_running:
                 goodbye_running = True
                 audio.stop()
