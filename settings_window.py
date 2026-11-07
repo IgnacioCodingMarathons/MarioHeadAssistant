@@ -1,5 +1,8 @@
 import math
 import random
+import threading
+import urllib.request
+from pathlib import Path
 
 DEFAULT_SETTINGS = {
     'chattiness': 5,
@@ -10,6 +13,12 @@ DEFAULT_SETTINGS = {
     'super_zen_mode': False,
     'oh_sorry': True,
     'caring_difficulty': 5,
+    'speech_use_one_method_only': False,
+    'speech_method_order': ['vosk_quick', 'google', 'vosk_smart'],
+    'speech_preferred_method': 'google',
+    'speech_enable_vosk': True,
+    'speech_enable_smart_vosk': False,
+    'speech_enable_google': True,
 }
 
 
@@ -25,14 +34,25 @@ def idle_delay(level):
     return random_delay(level, 45, 90) * (1 - level / 20)
 
 
-def create_settings_window(QtCore, QtWidgets, values, changed):
+def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
+    from PySide6 import QtGui
+
     window = QtWidgets.QWidget()
     window.setWindowTitle("Tweak Mario's Settings")
-    window.resize(420, 320)
+    window.resize(500, 560)
     layout = QtWidgets.QVBoxLayout(window)
     tabs = QtWidgets.QTabWidget()
     layout.addWidget(tabs)
     controls = {}
+
+    def add_scroll_tab(page, title):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        tabs.addTab(scroll, title)
+
     for title, sliders, checks in (
         ('Conversation', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness')],
          [('Zen Mode', 'zen_mode'), ('Super Zen Mode', 'super_zen_mode'),
@@ -64,15 +84,212 @@ def create_settings_window(QtCore, QtWidgets, values, changed):
             check.toggled.connect(lambda value, field=name: changed(field, value))
             controls[name] = check
             form.addRow(check)
-        tabs.addTab(page, title)
+        add_scroll_tab(page, title)
+
+    assets_dir = Path(assets_dir) if assets_dir is not None else Path(__file__).resolve().parent / 'assets'
+    method_options = (
+        ('vosk_quick', 'Vosk (quick)'),
+        ('google', 'Google'),
+        ('vosk_smart', 'Vosk (smart)'),
+    )
+    speech_page = QtWidgets.QWidget()
+    speech_layout = QtWidgets.QVBoxLayout(speech_page)
+    speech_layout.addWidget(QtWidgets.QLabel(
+        'Both Vosk options work offline. Google needs an internet connection. '
+        'It is recommended to use smart Vosk only if you have a mid-range to '
+        'powerful computer so that it takes less time to process.'
+    ))
+    use_one_method = QtWidgets.QCheckBox('Use one method only')
+    use_one_method.setChecked(values['speech_use_one_method_only'])
+    speech_layout.addWidget(use_one_method)
+    speech_layout.addWidget(QtWidgets.QLabel('Method order'))
+    method_order = QtWidgets.QListWidget()
+    method_order.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+    method_order.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+    order = values.get('speech_method_order', [])
+    order = [name for name in order if name in dict(method_options)]
+    order = list(dict.fromkeys(order))
+    order.extend(name for name, _ in method_options if name not in order)
+    order_items = {}
+    for method in order:
+        label = dict(method_options)[method]
+        item = QtWidgets.QListWidgetItem(label)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, method)
+        method_order.addItem(item)
+        order_items[method] = item
+    speech_layout.addWidget(method_order)
+    speech_layout.addWidget(QtWidgets.QLabel('Preferred method'))
+    preferred_method = QtWidgets.QComboBox()
+    preferred_model = QtGui.QStandardItemModel(preferred_method)
+    for method, label in method_options:
+        item = QtGui.QStandardItem(label)
+        item.setData(method, QtCore.Qt.ItemDataRole.UserRole)
+        preferred_model.appendRow(item)
+    preferred_method.setModel(preferred_model)
+    preferred_index = preferred_method.findData(
+        values.get('speech_preferred_method', 'google'),
+        QtCore.Qt.ItemDataRole.UserRole,
+    )
+    preferred_method.setCurrentIndex(max(0, preferred_index))
+    speech_layout.addWidget(preferred_method)
+    enable_vosk = QtWidgets.QCheckBox('Enable Vosk')
+    enable_vosk.setChecked(values['speech_enable_vosk'])
+    speech_layout.addWidget(enable_vosk)
+    enable_smart_vosk = QtWidgets.QCheckBox('Enable smart Vosk')
+    enable_smart_vosk.setChecked(values['speech_enable_smart_vosk'])
+    speech_layout.addWidget(enable_smart_vosk)
+    enable_google = QtWidgets.QCheckBox('Enable Google')
+    enable_google.setChecked(values['speech_enable_google'])
+    speech_layout.addWidget(enable_google)
+    online_status = QtWidgets.QLabel('Checking Google availability…')
+    speech_layout.addWidget(online_status)
+    add_scroll_tab(speech_page, 'Speech Recognition')
+
+    controls.update({
+        'speech_use_one_method_only': use_one_method,
+        'speech_preferred_method': preferred_method,
+        'speech_enable_vosk': enable_vosk,
+        'speech_enable_smart_vosk': enable_smart_vosk,
+        'speech_enable_google': enable_google,
+    })
+    google_online = [False]
+
+    def current_order():
+        return [
+            method_order.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(method_order.count())
+        ]
+
+    def method_availability():
+        vosk_enabled = enable_vosk.isChecked()
+        quick_available = vosk_enabled and (assets_dir / 'vosk').is_dir()
+        smart_available = (
+            vosk_enabled and enable_smart_vosk.isChecked()
+            and (assets_dir / 'vosksmart').is_dir()
+        )
+        google_available = enable_google.isChecked() and google_online[0]
+        return {
+            'vosk_quick': quick_available,
+            'google': google_available,
+            'vosk_smart': smart_available,
+        }
+
+    def update_method_controls():
+        available = method_availability()
+        for method, item in order_items.items():
+            flags = item.flags()
+            if available[method]:
+                flags |= (
+                    QtCore.Qt.ItemFlag.ItemIsEnabled
+                    | QtCore.Qt.ItemFlag.ItemIsSelectable
+                    | QtCore.Qt.ItemFlag.ItemIsDragEnabled
+                )
+            else:
+                flags &= ~(
+                    QtCore.Qt.ItemFlag.ItemIsEnabled
+                    | QtCore.Qt.ItemFlag.ItemIsSelectable
+                    | QtCore.Qt.ItemFlag.ItemIsDragEnabled
+                )
+            item.setFlags(flags)
+        for index, (method, _) in enumerate(method_options):
+            item = preferred_model.item(index)
+            flags = item.flags()
+            if available[method]:
+                flags |= QtCore.Qt.ItemFlag.ItemIsEnabled
+            else:
+                flags &= ~QtCore.Qt.ItemFlag.ItemIsEnabled
+            item.setFlags(flags)
+        one_only = use_one_method.isChecked()
+        method_order.setEnabled(not one_only)
+        preferred_method.setEnabled(one_only)
+        enable_smart_vosk.setEnabled(
+            enable_vosk.isChecked() and (assets_dir / 'vosksmart').is_dir()
+        )
+        if google_online[0]:
+            online_status.setText('Google is online')
+        else:
+            online_status.setText('Google is offline or unavailable')
+
+    def primary_method_changed(name, value):
+        other_name = 'speech_enable_google' if name == 'speech_enable_vosk' else 'speech_enable_vosk'
+        if not value and not controls[other_name].isChecked():
+            control = controls[name]
+            blocker = QtCore.QSignalBlocker(control)
+            control.setChecked(True)
+            del blocker
+            QtWidgets.QMessageBox.information(
+                window,
+                'Speech Recognition',
+                'At least one recognition provider must remain enabled.',
+            )
+            return
+        changed(name, value)
+        update_method_controls()
+
+    use_one_method.toggled.connect(
+        lambda value: (changed('speech_use_one_method_only', value), update_method_controls())
+    )
+    enable_vosk.toggled.connect(
+        lambda value: primary_method_changed('speech_enable_vosk', value)
+    )
+    enable_smart_vosk.toggled.connect(
+        lambda value: (changed('speech_enable_smart_vosk', value), update_method_controls())
+    )
+    enable_google.toggled.connect(
+        lambda value: primary_method_changed('speech_enable_google', value)
+    )
+    preferred_method.currentIndexChanged.connect(
+        lambda index: changed(
+            'speech_preferred_method',
+            preferred_method.itemData(index, QtCore.Qt.ItemDataRole.UserRole),
+        ) if index >= 0 else None
+    )
+    method_order.model().rowsMoved.connect(
+        lambda *args: changed('speech_method_order', current_order())
+    )
+    update_method_controls()
+
+    class OnlineCheck(QtCore.QObject):
+        result = QtCore.Signal(bool)
+
+        @QtCore.Slot(bool)
+        def apply(self, value):
+            google_online[0] = value
+            update_method_controls()
+
+    online_check = OnlineCheck(window)
+    online_check.result.connect(online_check.apply)
+
+    def check_online():
+        available = False
+        try:
+            request = urllib.request.Request(
+                'https://www.google.com/generate_204',
+                method='GET',
+                headers={'User-Agent': 'MarioAssistant'},
+            )
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                available = response.status in (200, 204)
+        except Exception:
+            pass
+        try:
+            online_check.result.emit(available)
+        except RuntimeError:
+            pass
+
+    threading.Thread(target=check_online, daemon=True).start()
 
     def sync(name, value):
         control = controls[name]
         blocker = QtCore.QSignalBlocker(control)
         if isinstance(control, QtWidgets.QCheckBox):
             control.setChecked(value)
+        elif isinstance(control, QtWidgets.QComboBox):
+            control.setCurrentIndex(control.findData(value, QtCore.Qt.ItemDataRole.UserRole))
         else:
             control.setValue(value)
         del blocker
+        if name == 'speech_use_one_method_only':
+            update_method_controls()
 
     return window, sync

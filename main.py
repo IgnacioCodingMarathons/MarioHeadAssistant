@@ -29,7 +29,6 @@ from voice_commands import (
     MicrophoneCapture,
     SpeechTranscriber,
     create_beep_sound,
-    interpret_voice_command,
 )
 
 
@@ -200,6 +199,7 @@ def create_context_menu(Gtk, menu_action, stop_only=False):
         ("Speak", "speak"),
         ("Quench hunger", "quench_hunger"),
         ("Quench thirst", "quench_thirst"),
+        ("Mario's voice command list", "commands"),
         ("Goodbye", "goodbye"),
     )
     for label, action in options:
@@ -230,6 +230,39 @@ def create_minigames_window(QtWidgets, minigame_action):
     )
     layout.addWidget(game_list)
     layout.addWidget(play_button)
+    return window
+
+
+def create_voice_commands_window(QtCore, QtWidgets):
+    window = QtWidgets.QWidget()
+    window.setWindowTitle("Mario's commands!")
+    window.resize(520, 430)
+    layout = QtWidgets.QVBoxLayout(window)
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    content = QtWidgets.QWidget()
+    content_layout = QtWidgets.QVBoxLayout(content)
+    text = QtWidgets.QLabel(
+        "Say a trigger phrase to run its action:\n\n"
+        "‘stop’ / ‘shut up’ / ‘skip’ / ‘silence’ / ‘shut your mouth’ / ‘stop it’ — Stop Mario's current clip.\n\n"
+        "‘goodbye’ — Close Mario with his goodbye sequence.\n\n"
+        "‘move’ / ‘out of the way’ / ‘out of my way’ — Move Mario.\n\n"
+        "‘open’ and/or ‘interactive’ and/or ‘Mario’ + ‘minigames’ — Open the minigame picker.\n\n"
+        "‘play’ and/or ‘Mario’ + ‘Tunnel of Doom’ — Start Tunnel of Doom.\n\n"
+        "‘play’ and/or ‘Mario’ + ‘something in my eye’ — Start the eye minigame.\n\n"
+        "‘debug’ — Open Super Debug.\n\n"
+        "‘open’ and/or ‘Mario's’ and/or ‘pet care’ — Open Pet Care.\n\n"
+        "‘open’ and/or ‘settings’, or ‘configure’ — Open Settings.\n\n"
+        "‘speak’ / ‘say something’ — Play a random idle clip.\n\n"
+        "‘quench’ + (optional ‘Mario's’) + ‘hunger’ or ‘thirst’ — Choose files for that meter.\n\n"
+        "(optional ‘see’) (optional ‘Mario's’) ‘voice’ + ‘command’ or ‘commands’ + (optional ‘list’). Without ‘list’, you can say ‘to say’ or ‘to use’. — Show this list."
+    )
+    text.setWordWrap(True)
+    text.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+    text.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+    content_layout.addWidget(text)
+    scroll.setWidget(content)
+    layout.addWidget(scroll)
     return window
 
 def create_debug_window(QtWidgets, live_values):
@@ -378,7 +411,9 @@ def show_context_menu(Gtk, Gdk, menu_action, active_menu, stop_only=False):
             ("Super Debug", "superdebug"), ("Pet Care", "petcare"),
             ("Settings", "settings"), ("Speak", "speak"),
             ("Quench hunger", "quench_hunger"),
-            ("Quench thirst", "quench_thirst"), ("Goodbye", "goodbye"),
+            ("Quench thirst", "quench_thirst"),
+            ("Mario's voice command list", "commands"),
+            ("Goodbye", "goodbye"),
         )
         for label, action in options:
             item = menu.addAction(label)
@@ -441,6 +476,7 @@ def create_tray_menu(QtWidgets, tray, menu_action, live_values):
         ("Speak", "speak"),
         ("Quench hunger", "quench_hunger"),
         ("Quench thirst", "quench_thirst"),
+        ("Mario's voice command list", "commands"),
         ("Goodbye", "goodbye"),
     ):
         action = menu.addAction(label)
@@ -764,6 +800,27 @@ def main() -> None:
     preferences.update({name: initial_save.get(name, value) for name, value in DEFAULT_SETTINGS.items()})
     for name in ("chattiness", "playfulness", "wandering", "caring_difficulty"):
         preferences[name] = max(0, min(10, int(preferences[name])))
+    speech_methods = {"vosk_quick", "google", "vosk_smart"}
+    speech_order = preferences.get("speech_method_order")
+    if not isinstance(speech_order, list):
+        speech_order = list(DEFAULT_SETTINGS["speech_method_order"])
+    speech_order = list(dict.fromkeys(
+        method for method in speech_order
+        if isinstance(method, str) and method in speech_methods
+    ))
+    speech_order.extend(
+        method for method in DEFAULT_SETTINGS["speech_method_order"]
+        if method not in speech_order
+    )
+    preferences["speech_method_order"] = speech_order
+    if (not isinstance(preferences.get("speech_preferred_method"), str)
+            or preferences["speech_preferred_method"] not in speech_methods):
+        preferences["speech_preferred_method"] = "google"
+    for name in (
+        "speech_use_one_method_only", "speech_enable_vosk",
+        "speech_enable_smart_vosk", "speech_enable_google",
+    ):
+        preferences[name] = bool(preferences[name])
     pet = PetNeeds(
         initial_save, difficulty=preferences["caring_difficulty"]
     )
@@ -833,7 +890,7 @@ def main() -> None:
         pygame.mixer.init(frequency=44_100, size=-16, channels=2, buffer=1024)
         voice_beep_sound = create_beep_sound(pygame)
         voice_beep_channel = pygame.mixer.Channel(7)
-        voice_transcriber = SpeechTranscriber(ASSETS)
+        voice_transcriber = SpeechTranscriber(ASSETS, preferences)
         voice_results = queue.Queue()
         voice_processing = False
         voice_animation_deadline = 0.0
@@ -877,45 +934,12 @@ def main() -> None:
                 voice_state["samples"] = None
             begin_voice_beeps("finishing")
 
-        def report_voice_transcript(engine, transcript):
-            action = interpret_voice_command(transcript)
-            engine_name = "Google" if engine == "google" else "Vosk"
-            if action is None:
-                result = "did not match a supported command"
-            else:
-                result = f"got it right: command {action!r}"
-            print(
-                f"MarioAssistant voice: {engine_name} {result}; "
-                f"transcript: {transcript!r}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return action
-
         def transcribe_voice(samples):
             try:
-                transcript = voice_transcriber.transcribe(samples)
-                engine = voice_transcriber.last_engine
-                action = report_voice_transcript(engine, transcript)
-                if engine == "vosk" and action is None:
-                    print(
-                        "MarioAssistant voice: trying Google SpeechRecognition "
-                        "because Vosk did not match a command",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    transcript = voice_transcriber.transcribe_google(samples)
-                    engine = voice_transcriber.last_engine
-                    action = report_voice_transcript(engine, transcript)
-                if action is None:
-                    print(
-                        "MarioAssistant voice: neither recognizer matched a supported command",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                voice_results.put((transcript, None))
+                transcript, engine, action = voice_transcriber.transcribe(samples)
+                voice_results.put((transcript, None, action))
             except Exception as exc:
-                voice_results.put((None, exc))
+                voice_results.put((None, exc, None))
 
         audio_path = Path(temp_dir.name) / f"{video.stem}.wav"
         subprocess.run(
@@ -985,6 +1009,7 @@ def main() -> None:
         tray_update = None
         minigame_action = [None]
         minigames_window = None
+        voice_commands_window = None
         debug_window = None
         debug_update = None
         last_debug_schedule_update = 0.0
@@ -1046,7 +1071,7 @@ def main() -> None:
                 else:
                     voice_state["phase"] = "idle"
                     if voice_state["error"] is not None:
-                        voice_results.put((None, voice_state["error"]))
+                        voice_results.put((None, voice_state["error"], None))
                     elif voice_state["samples"] is not None:
                         voice_processing = True
                         voice_animation_done = False
@@ -1096,7 +1121,7 @@ def main() -> None:
                     voice_state["samples"] = None
                     voice_state["error"] = None
             try:
-                transcript, voice_error = voice_results.get_nowait()
+                transcript, voice_error, voice_action = voice_results.get_nowait()
             except queue.Empty:
                 pass
             else:
@@ -1119,9 +1144,10 @@ def main() -> None:
                         )
                         menu_action[0] = "voice_apology"
                     else:
-                        voice_action = interpret_voice_command(transcript)
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
+                        elif voice_action is not None:
+                            menu_action[0] = voice_action
                         else:
                             menu_action[0] = voice_action or "voice_apology"
                 else:
@@ -1134,7 +1160,6 @@ def main() -> None:
                         )
                         menu_action[0] = "voice_apology"
                     else:
-                        voice_action = interpret_voice_command(transcript)
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
                         else:
@@ -1534,7 +1559,7 @@ def main() -> None:
                         print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                 pet_notification_close_at.clear()
                 write_save_data(save_path, pet.snapshot())
-                for auxiliary in (settings_window, minigames_window, debug_window, care_window):
+                for auxiliary in (settings_window, minigames_window, debug_window, care_window, voice_commands_window):
                     if auxiliary is not None:
                         auxiliary.hide()
                 goodbye_completed = run_goodbye(
@@ -1557,10 +1582,19 @@ def main() -> None:
                     settings_window, settings_sync = create_settings_window(
                         QtCore, QtWidgets, preferences,
                         lambda name, value: settings_changes.append((name, value)),
+                        ASSETS,
                     )
                 settings_window.show()
                 settings_window.raise_()
                 settings_window.activateWindow()
+            elif selected_action == "commands":
+                if voice_commands_window is None:
+                    voice_commands_window = create_voice_commands_window(
+                        QtCore, QtWidgets
+                    )
+                voice_commands_window.show()
+                voice_commands_window.raise_()
+                voice_commands_window.activateWindow()
             elif selected_action == "move":
                 desktop_sizes = pygame.display.get_desktop_sizes()
                 display_index = min(window.display_index, len(desktop_sizes) - 1)
