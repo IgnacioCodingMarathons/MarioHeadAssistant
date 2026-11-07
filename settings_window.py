@@ -9,6 +9,7 @@ DEFAULT_SETTINGS = {
     'zen_mode': False,
     'super_zen_mode': False,
     'oh_sorry': True,
+    'caring_difficulty': 5,
 }
 
 
@@ -38,6 +39,7 @@ def create_settings_window(QtCore, QtWidgets, values, changed):
           ('"Oh, sorry!"', 'oh_sorry')]),
         ('Movement', [('Wandering', 'wandering')],
          [('Use entropy for position', 'use_entropy_for_position')]),
+        ('Pet Care', [('Caring Difficulty', 'caring_difficulty')], []),
     ):
         page = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(page)

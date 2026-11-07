@@ -78,7 +78,7 @@ def play_tunnel_of_doom(
             Gtk.main_iteration_do(False)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return 'quit'
+                return 'close'
             if event.type == pygame.DROPFILE and on_drop is not None:
                 on_drop(event.file, pygame.mouse.get_pos()[0])
             if event.type == pygame.KEYDOWN:

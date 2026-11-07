@@ -19,7 +19,11 @@ from pygame._sdl2 import Renderer, Texture, Window
 from tunnel_of_doom import play_tunnel_of_doom
 from settings_window import DEFAULT_SETTINGS, create_settings_window, random_delay, idle_delay
 from desktop_support import DesktopNotifications, play_information_sound
-from window_policy import install_linux_window_policy, keep_sdl_window_above
+from window_policy import (
+    install_linux_window_policy,
+    keep_sdl_window_above,
+    set_sdl_window_attention,
+)
 from pet_care import PetNeeds, create_pet_care_window
 
 
@@ -144,12 +148,14 @@ def start_decoder(ffmpeg: str, video: Path):
 
 def stop_decoder(process, stop, reader):
     stop.set()
-    if process.poll() is None:
-        process.terminate()
-    if process.stdout is not None:
-        process.stdout.close()
-    process.wait()
-    reader.join(timeout=0.25)
+    if process is not None:
+        if process.poll() is None:
+            process.terminate()
+        if process.stdout is not None:
+            process.stdout.close()
+        process.wait()
+    if reader is not None:
+        reader.join(timeout=0.25)
 
 
 def start_media(ffmpeg, temp_dir, video_texture, process, stop, reader, video):
@@ -169,7 +175,7 @@ def start_media(ffmpeg, temp_dir, video_texture, process, stop, reader, video):
     return audio, frame, last_frame, process, frames, stop, reader
 
 
-def create_context_menu(Gtk, menu_action):
+def create_context_menu(Gtk, menu_action, stop_only=False):
     menu = Gtk.Menu()
 
     def keep_menu_above(widget):
@@ -178,7 +184,7 @@ def create_context_menu(Gtk, menu_action):
             popup.set_keep_above(True)
 
     menu.connect("map", keep_menu_above)
-    for label, action in (
+    options = (("Stop", "stop"),) if stop_only else (
         ("Stop", "stop"),
         ("Move", "move"),
         ("IM Minigames", "minigames"),
@@ -186,7 +192,8 @@ def create_context_menu(Gtk, menu_action):
         ("Pet Care", "petcare"),
         ("Settings", "settings"),
         ("Goodbye", "goodbye"),
-    ):
+    )
+    for label, action in options:
         item = Gtk.MenuItem.new_with_label(label)
         item.connect(
             "activate",
@@ -219,7 +226,7 @@ def create_minigames_window(QtWidgets, minigame_action):
 def create_debug_window(QtWidgets, live_values):
     window = QtWidgets.QWidget()
     window.setWindowTitle("SUPER DEBUG!!!!")
-    window.setMinimumSize(360, 180)
+    window.setMinimumSize(360, 230)
     layout = QtWidgets.QVBoxLayout(window)
     mariocoins_label = QtWidgets.QLabel()
     zen_mode_label = QtWidgets.QLabel()
@@ -227,6 +234,8 @@ def create_debug_window(QtWidgets, live_values):
     eye_schedule_label = QtWidgets.QLabel()
     idle_schedule_label = QtWidgets.QLabel()
     wander_schedule_label = QtWidgets.QLabel()
+    hunger_schedule_label = QtWidgets.QLabel()
+    thirst_schedule_label = QtWidgets.QLabel()
     hunger_label = QtWidgets.QLabel()
     thirst_label = QtWidgets.QLabel()
 
@@ -237,6 +246,8 @@ def create_debug_window(QtWidgets, live_values):
         "eye_schedule": eye_schedule_label,
         "idle_schedule": idle_schedule_label,
         "wander_schedule": wander_schedule_label,
+        "hunger_schedule": hunger_schedule_label,
+        "thirst_schedule": thirst_schedule_label,
         "hunger": hunger_label,
         "thirst": thirst_label,
     }
@@ -267,6 +278,8 @@ def create_debug_window(QtWidgets, live_values):
     layout.addWidget(eye_schedule_label)
     layout.addWidget(idle_schedule_label)
     layout.addWidget(wander_schedule_label)
+    layout.addWidget(hunger_schedule_label)
+    layout.addWidget(thirst_schedule_label)
     layout.addWidget(hunger_label)
     layout.addWidget(thirst_label)
     update_value(force=True)
@@ -345,15 +358,18 @@ def show_coin_change(QtCore, QtWidgets, previous, current):
     popup.destroyed.connect(lambda: COIN_POPUPS.remove(popup) if popup in COIN_POPUPS else None)
     timer.start(16)
 
-def show_context_menu(Gtk, Gdk, menu_action, active_menu):
+def show_context_menu(Gtk, Gdk, menu_action, active_menu, stop_only=False):
     if Gtk is None:
         from PySide6 import QtGui, QtWidgets
         if active_menu[0] is not None:
             active_menu[0].close()
         menu = QtWidgets.QMenu()
-        for label, action in (("Stop", "stop"), ("Move", "move"), ("IM Minigames", "minigames"),
-                              ("Super Debug", "superdebug"), ("Pet Care", "petcare"), ("Settings", "settings"),
-                              ("Goodbye", "goodbye")):
+        options = (("Stop", "stop"),) if stop_only else (
+            ("Stop", "stop"), ("Move", "move"), ("IM Minigames", "minigames"),
+            ("Super Debug", "superdebug"), ("Pet Care", "petcare"),
+            ("Settings", "settings"), ("Goodbye", "goodbye"),
+        )
+        for label, action in options:
             item = menu.addAction(label)
             item.triggered.connect(lambda checked=False, selected=action: menu_action.__setitem__(0, selected))
         active_menu[0] = menu
@@ -362,7 +378,7 @@ def show_context_menu(Gtk, Gdk, menu_action, active_menu):
     if active_menu[0] is not None:
         active_menu[0].popdown()
         active_menu[0].destroy()
-    menu = create_context_menu(Gtk, menu_action)
+    menu = create_context_menu(Gtk, menu_action, stop_only)
     _, x, y = (
         Gdk.Display.get_default()
         .get_default_seat()
@@ -433,6 +449,16 @@ def create_tray_menu(QtWidgets, tray, menu_action, live_values):
 
     update()
     return update
+
+
+def set_tray_stop_menu(QtWidgets, tray, menu_action):
+    menu = QtWidgets.QMenu()
+    action = menu.addAction("Stop")
+    action.triggered.connect(
+        lambda checked=False: menu_action.__setitem__(0, "stop")
+    )
+    tray.setContextMenu(menu)
+    return menu
 
 
 def show_full_meter_message(meter, hunger, thirst):
@@ -581,21 +607,39 @@ def wander_destination(area, size, current, preferences):
                           key=lambda point: math.dist(current, point))
     return destination, (x, y, x + travel_x, y + travel_y)
 
-def run_goodbye(ffmpeg, temp_dir, window, renderer, texture, process, stop, reader, qt_app, Gtk):
+def run_goodbye(ffmpeg, temp_dir, window, renderer, texture, process, stop, reader, qt_app, Gtk, Gdk, QtWidgets, tray):
     clock = pygame.time.Clock()
+    menu_action = [None]
+    active_menu = [None]
+    controls = {"star": False, "minus": False, "skip": False}
+    set_tray_stop_menu(QtWidgets, tray, menu_action)
 
     def pump():
         qt_app.processEvents()
         while Gtk is not None and Gtk.events_pending():
             Gtk.main_iteration_do(False)
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return False
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                show_context_menu(Gtk, Gdk, menu_action, active_menu, True)
+            elif event.type == pygame.KEYDOWN:
+                if (event.key == pygame.K_KP_MULTIPLY
+                        or getattr(event, "unicode", "") == "*"
+                        or (event.key == pygame.K_8 and event.mod & pygame.KMOD_SHIFT)):
+                    controls["star"] = True
+                if (event.key in (pygame.K_MINUS, pygame.K_KP_MINUS)
+                        or getattr(event, "unicode", "") == "-"):
+                    controls["minus"] = True
+                if controls["star"] and controls["minus"]:
+                    controls["skip"] = True
+            elif event.type == pygame.KEYUP:
+                if event.key in (pygame.K_8, pygame.K_KP_MULTIPLY):
+                    controls["star"] = False
+                if event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    controls["minus"] = False
         renderer.clear()
         texture.draw(dstrect=(0, 0, *window.size))
         renderer.present()
         clock.tick(60)
-        return True
 
     def tween(destination, fixed_center=None):
         origin = (*window.position, *window.size)
@@ -609,8 +653,7 @@ def run_goodbye(ffmpeg, temp_dir, window, renderer, texture, process, stop, read
                 x = round(fixed_center[0] - max(1, width) / 2)
                 y = round(fixed_center[1] - max(1, height) / 2)
             window.position = (x, y)
-            if not pump():
-                return False
+            pump()
             if progress >= 1:
                 return True
 
@@ -619,8 +662,7 @@ def run_goodbye(ffmpeg, temp_dir, window, renderer, texture, process, stop, read
     desktop_width, desktop_height = desktop_sizes[min(window.display_index, len(desktop_sizes) - 1)]
     x = (desktop_width - WINDOW_SIZE[0]) // 2
     y = (desktop_height - WINDOW_SIZE[1]) // 2
-    if not tween((x, y, *WINDOW_SIZE)):
-        return True
+    tween((x, y, *WINDOW_SIZE))
     video = ASSETS / "okbyebye.mp4"
     sound_path = Path(temp_dir.name) / "okbyebye.wav"
     subprocess.run(
@@ -637,8 +679,13 @@ def run_goodbye(ffmpeg, temp_dir, window, renderer, texture, process, stop, read
     try:
         sound.play()
         while not done:
-            if not pump():
-                return True
+            pump()
+            if menu_action[0] == "stop":
+                menu_action[0] = None
+                controls["skip"] = True
+            if controls["skip"]:
+                done = True
+                break
             target = int((time.monotonic() - started) * VIDEO_FPS) + 1
             while consumed < target:
                 try:
@@ -701,9 +748,11 @@ def main() -> None:
         initial_save["wandering"] = initial_save["shuffling"]
     preferences = dict(DEFAULT_SETTINGS)
     preferences.update({name: initial_save.get(name, value) for name, value in DEFAULT_SETTINGS.items()})
-    for name in ("chattiness", "playfulness", "wandering"):
+    for name in ("chattiness", "playfulness", "wandering", "caring_difficulty"):
         preferences[name] = max(0, min(10, int(preferences[name])))
-    pet = PetNeeds(initial_save)
+    pet = PetNeeds(
+        initial_save, difficulty=preferences["caring_difficulty"]
+    )
     pet_drops = []
 
     def queue_pet_drop(filename, drop_x=None):
@@ -735,6 +784,10 @@ def main() -> None:
         always_on_top=True,
     )
     keep_sdl_window_above(window)
+    pet_attention_active = any(pet.needy.values())
+    window.title = "MarioAssistant (Hey!)" if pet_attention_active else "MarioAssistant"
+    if pet_attention_active:
+        set_sdl_window_attention(window, True)
     renderer = Renderer(window, accelerated=False)
     preparing_texture = Texture(renderer, WINDOW_SIZE, streaming=True)
     clock = pygame.time.Clock()
@@ -781,14 +834,30 @@ def main() -> None:
         desktop_width, desktop_height = pygame.display.get_desktop_sizes()[0]
         center = (desktop_width // 2, desktop_height // 2)
         video_texture = Texture(renderer, VIDEO_SIZE, streaming=True)
+        menu_action = [None]
+        active_menu = [None]
+        set_tray_stop_menu(QtWidgets, NOTIFICATIONS.tray, menu_action)
+        booting = True
+        startup_goodbye = False
         window.size = (1, 1)
         window.position = (center[0], center[1])
         video_texture.update(frame_surface)
         tween_started = time.monotonic()
         while True:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    return
+                if event.type in (pygame.QUIT, getattr(pygame, "WINDOWCLOSE", -1)):
+                    startup_goodbye = True
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                    show_context_menu(
+                        Gtk, Gdk, menu_action, active_menu, stop_only=True
+                    )
+            if startup_goodbye:
+                goodbye_completed = run_goodbye(
+                    ffmpeg, temp_dir, window, renderer, video_texture,
+                    process, stop, reader, qt_app, Gtk, Gdk, QtWidgets,
+                    NOTIFICATIONS.tray,
+                )
+                return
             progress = min(1.0, (time.monotonic() - tween_started) / TWEEN_SECONDS)
             eased = back_in_out(progress)
             width = max(1, round(1 + (WINDOW_SIZE[0] - 1) * eased))
@@ -813,14 +882,12 @@ def main() -> None:
         is_greeting = True
         last_window_position = tuple(window.position)
         window_move_changed_at = None
-        menu_action = [None]
-        tray_update = create_tray_menu(
-            QtWidgets, NOTIFICATIONS.tray, menu_action, live_values
-        )
+        tray_update = None
         minigame_action = [None]
         minigames_window = None
         debug_window = None
         debug_update = None
+        last_debug_schedule_update = 0.0
         care_window = None
         care_update = None
         pet_video = None
@@ -836,7 +903,6 @@ def main() -> None:
         settings_sync = None
         settings_changes = []
         eye_manual = False
-        active_menu = [None]
         move_tween = None
         eye_video = ASSETS / "somethinginmyeye.avi"
         eye_event = None
@@ -853,6 +919,7 @@ def main() -> None:
             disappointment_sound.play()
 
         running = True
+        goodbye_running = False
         while running:
             clock.tick(60)
             qt_app.processEvents()
@@ -875,6 +942,8 @@ def main() -> None:
                     last_window_position = observed
             for name, value in settings_changes:
                 preferences[name] = value
+                if name == "caring_difficulty":
+                    pet.set_difficulty(value)
                 write_save_data(save_path, {name: value, **pet.snapshot()})
                 if name == "zen_mode":
                     zen_mode = value
@@ -908,6 +977,23 @@ def main() -> None:
                     if value == 0 and move_tween is not None and move_tween.get("wander"):
                         move_tween = None
                         last_window_position = tuple(window.position)
+                elif name == "caring_difficulty" and value == 0:
+                    pet_notification_close_at.clear()
+                    pet_alert_need = None
+                    for need_name in tuple(pet_notifications):
+                        try:
+                            close_notification(
+                                Gio, GLib, pet_notifications.pop(need_name)
+                            )
+                        except Exception as exc:
+                            print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    if pet_video is not None:
+                        audio.stop()
+                        stop_decoder(process, stop, reader)
+                        pet_video = None
+                        finished = True
+                        frame_surface = greeting_first_surface
+                        frame_dirty = True
                 if name in live_values:
                     live_values[name] = value
                     if debug_update is not None:
@@ -918,8 +1004,9 @@ def main() -> None:
             for event in pygame.event.get():
                 if event.type in (pygame.WINDOWSHOWN, pygame.WINDOWRESTORED):
                     keep_sdl_window_above(window)
-                elif event.type == pygame.QUIT:
-                    running = False
+                elif event.type in (pygame.QUIT, getattr(pygame, "WINDOWCLOSE", -1)):
+                    if not goodbye_running:
+                        menu_action[0] = "goodbye"
                 elif event.type == pygame.DROPFILE:
                     queue_pet_drop(event.file)
                 elif event.type == pygame.KEYDOWN:
@@ -979,13 +1066,17 @@ def main() -> None:
                     if not (star_down and minus_down):
                         chord_latched = False
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
-                    show_context_menu(Gtk, Gdk, menu_action, active_menu)
+                    show_context_menu(
+                        Gtk, Gdk, menu_action, active_menu, stop_only=booting
+                    )
                 elif (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                       and eye_event is not None
                       and time.monotonic() - eye_event >= 2.75):
                     collect_eye = True
 
             for dropped_file, target_need in pet_drops:
+                if preferences["caring_difficulty"] == 0:
+                    continue
                 try:
                     fed = pet.feed(dropped_file, target=target_need)
                 except OSError:
@@ -1108,19 +1199,29 @@ def main() -> None:
 
             selected_action = menu_action[0]
             menu_action[0] = None
-            if selected_action == "goodbye":
+            if selected_action == "goodbye" and not goodbye_running:
+                goodbye_running = True
                 audio.stop()
                 try:
                     close_notification(Gio, GLib, eye_notification)
                 except Exception as exc:
                     print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                for need_name in tuple(pet_notifications):
+                    try:
+                        close_notification(
+                            Gio, GLib, pet_notifications.pop(need_name)
+                        )
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                pet_notification_close_at.clear()
                 write_save_data(save_path, pet.snapshot())
                 for auxiliary in (settings_window, minigames_window, debug_window, care_window):
                     if auxiliary is not None:
                         auxiliary.hide()
                 goodbye_completed = run_goodbye(
                     ffmpeg, temp_dir, window, renderer, video_texture, process,
-                    stop, reader, qt_app, Gtk,
+                    stop, reader, qt_app, Gtk, Gdk, QtWidgets,
+                    NOTIFICATIONS.tray,
                 )
                 running = False
                 break
@@ -1214,6 +1315,28 @@ def main() -> None:
                     QtWidgets.QMessageBox.warning(
                         minigames_window, "Mario's Tunnel of Doom", str(exc)
                     )
+                if outcome == "close":
+                    goodbye_running = True
+                    audio.stop()
+                    for need_name in tuple(pet_notifications):
+                        try:
+                            close_notification(
+                                Gio, GLib, pet_notifications.pop(need_name)
+                            )
+                        except Exception as exc:
+                            print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    pet_notification_close_at.clear()
+                    for auxiliary in (settings_window, minigames_window, debug_window, care_window):
+                        if auxiliary is not None:
+                            auxiliary.hide()
+                    write_save_data(save_path, pet.snapshot())
+                    goodbye_completed = run_goodbye(
+                        ffmpeg, temp_dir, window, renderer, video_texture,
+                        process, stop, reader, qt_app, Gtk, Gdk, QtWidgets,
+                        NOTIFICATIONS.tray,
+                    )
+                    running = False
+                    break
                 if outcome == "quit":
                     running = False
                 elif outcome in ("win", "lose"):
@@ -1231,10 +1354,38 @@ def main() -> None:
                 random_events_ready_at = time.monotonic() + 10
 
             due_need = pet.due()
-            if (due_need is not None and finished and eye_event is None
+            if (due_need is not None and pet_video is not None
+                    and due_need != pet_alert_need):
+                audio.stop()
+                pet_video = ASSETS / ("heyimhungry.avi" if due_need == "hunger" else "heyimthirsty.avi")
+                need_messages = {
+                    "hunger": "I'm hungry! Have you got any food?",
+                    "thirst": "I'm thirsty! You got something to drinky?",
+                }
+                previous_notification = pet_notifications.get(due_need)
+                replace_id = previous_notification[1] if Gio is not None and previous_notification else 0
+                try:
+                    pet_notifications[due_need] = send_notification(
+                        Gio, GLib, replace_id, "Hey!", need_messages[due_need]
+                    )
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                pet_alert_need = due_need
+                (
+                    audio, frame_surface, last_frame_surface, process,
+                    frames, stop, reader,
+                ) = start_media(ffmpeg, temp_dir, video_texture, process, stop, reader, pet_video)
+                video = pet_video
+                pet.remind(due_need)
+                started = time.monotonic()
+                consumed = 0
+                finished = False
+                frame_dirty = False
+                is_greeting = False
+                greeting_tween_started = True
+            elif (due_need is not None and finished and eye_event is None
                     and move_tween is None and post_greeting_tween is None
-                    and minigame_action[0] is None
-                    and time.monotonic() >= random_events_ready_at):
+                    and minigame_action[0] is None):
                 audio.stop()
                 pet_video = ASSETS / ("heyimhungry.avi" if due_need == "hunger" else "heyimthirsty.avi")
                 need_messages = {
@@ -1449,6 +1600,11 @@ def main() -> None:
                     post_greeting_tween = None
                     last_window_position = tuple(window.position)
                     window_move_changed_at = None
+                    if booting:
+                        booting = False
+                        tray_update = create_tray_menu(
+                            QtWidgets, NOTIFICATIONS.tray, menu_action, live_values
+                        )
 
             if move_tween is not None:
                 progress = min(
@@ -1552,34 +1708,45 @@ def main() -> None:
                         debug_update(name)
                     if care_update is not None and care_window.isVisible():
                         care_update()
-            tray_update()
+            if tray_update is not None:
+                tray_update()
             if time.monotonic() - last_pet_save >= 30:
                 write_save_data(save_path, pet.snapshot())
                 last_pet_save = time.monotonic()
 
             now = time.monotonic()
-            for name, label, deadline, active in (
-                ("eye_schedule", "Eye minigame", next_eye_at, eye_event is not None),
-                ("idle_schedule", "Idle clip", next_idle_at, idle_playing),
-                ("wander_schedule", "Wandering", next_wander_at, move_tween is not None and move_tween.get("wander", False)),
-            ):
-                if not math.isfinite(deadline):
-                    value = f"{label}: Disabled"
+            pet_attention = any(pet.needy.values()) or eye_event is not None
+            if pet_attention != pet_attention_active:
+                pet_attention_active = pet_attention
+                window.title = "MarioAssistant (Hey!)" if pet_attention else "MarioAssistant"
+                set_sdl_window_attention(window, pet_attention)
+
+            if (debug_window is not None and debug_window.isVisible()
+                    and now - last_debug_schedule_update >= 1):
+                last_debug_schedule_update = now
+                schedules = [
+                    ("eye_schedule", "Eye minigame", next_eye_at, eye_event is not None, False),
+                    ("idle_schedule", "Idle clip", next_idle_at, idle_playing, False),
+                    ("wander_schedule", "Wandering", next_wander_at, move_tween is not None and move_tween.get("wander", False), False),
+                    ("hunger_schedule", "Hunger notification", pet.next_notification_at("hunger"), pet_alert_need == "hunger", not pet.needy["hunger"]),
+                    ("thirst_schedule", "Thirst notification", pet.next_notification_at("thirst"), pet_alert_need == "thirst", not pet.needy["thirst"]),
+                ]
+                for name, label, deadline, active, estimated in schedules:
+                    if not math.isfinite(deadline):
+                        value = f"{label}: Disabled"
+                    else:
+                        scheduled_time = datetime.fromtimestamp(
+                            wall_clock_offset + deadline
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        remaining = max(0, math.ceil(deadline - now))
+                        status = "Playing" if active else f"{remaining}s remaining"
+                        value = f"{label}: {scheduled_time} ({status})"
+                        if estimated:
+                            value += " (ESTIMATION)"
                     if live_values.get(name) != value:
                         live_values[name] = value
                         if debug_update is not None:
                             debug_update(name)
-                    continue
-                scheduled_time = datetime.fromtimestamp(
-                    wall_clock_offset + deadline
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                remaining = max(0, math.ceil(deadline - now))
-                status = "Playing" if active else f"{remaining}s remaining"
-                value = f"{label}: {scheduled_time} ({status})"
-                if live_values.get(name) != value:
-                    live_values[name] = value
-                    if debug_update is not None:
-                        debug_update(name)
 
             if frame_dirty:
                 video_texture.update(frame_surface)
