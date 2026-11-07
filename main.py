@@ -25,6 +25,12 @@ from window_policy import (
     set_sdl_window_attention,
 )
 from pet_care import PetNeeds, create_pet_care_window
+from voice_commands import (
+    MicrophoneCapture,
+    SpeechTranscriber,
+    create_beep_sound,
+    interpret_voice_command,
+)
 
 
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -817,6 +823,55 @@ def main() -> None:
         renderer.present()
 
         pygame.mixer.init(frequency=44_100, size=-16, channels=2, buffer=1024)
+        voice_beep_sound = create_beep_sound(pygame)
+        voice_beep_channel = pygame.mixer.Channel(7)
+        voice_transcriber = SpeechTranscriber(ASSETS)
+        voice_results = queue.Queue()
+        voice_keys_down = set()
+        voice_control_keys = {pygame.K_LCTRL, pygame.K_RCTRL}
+        voice_shift_keys = {pygame.K_LSHIFT, pygame.K_RSHIFT}
+        voice_state = {
+            "phase": "idle",
+            "step": 0,
+            "deadline": 0.0,
+            "capture": None,
+            "samples": None,
+            "error": None,
+        }
+
+        def voice_chord_held():
+            return (
+                bool(voice_keys_down & voice_control_keys)
+                and bool(voice_keys_down & voice_shift_keys)
+                and pygame.K_l in voice_keys_down
+                and pygame.key.get_focused()
+            )
+
+        def begin_voice_beeps(phase):
+            voice_state["phase"] = phase
+            voice_state["step"] = 0
+            voice_state["deadline"] = time.monotonic() + 0.25
+            voice_beep_channel.play(voice_beep_sound)
+
+        def finish_voice_capture():
+            phase = voice_state["phase"]
+            if phase == "listening":
+                try:
+                    voice_state["samples"] = voice_state["capture"].stop()
+                    voice_state["capture"] = None
+                except Exception as exc:
+                    voice_state["error"] = exc
+                    voice_state["capture"] = None
+            else:
+                voice_state["samples"] = None
+            begin_voice_beeps("finishing")
+
+        def transcribe_voice(samples):
+            try:
+                voice_results.put((voice_transcriber.transcribe(samples), None))
+            except Exception as exc:
+                voice_results.put((None, exc))
+
         audio_path = Path(temp_dir.name) / f"{video.stem}.wav"
         subprocess.run(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
@@ -923,6 +978,51 @@ def main() -> None:
         while running:
             clock.tick(60)
             qt_app.processEvents()
+            now = time.monotonic()
+            if (voice_state["phase"] in ("arming", "finishing")
+                    and now >= voice_state["deadline"]):
+                if voice_state["step"] == 0:
+                    voice_state["step"] = 1
+                    voice_state["deadline"] = now + 0.25
+                elif voice_state["step"] == 1:
+                    voice_state["step"] = 2
+                    voice_beep_channel.play(voice_beep_sound)
+                    voice_state["deadline"] = now + 0.25
+                elif voice_state["phase"] == "arming":
+                    if voice_chord_held():
+                        try:
+                            voice_state["capture"] = MicrophoneCapture()
+                            voice_state["phase"] = "listening"
+                        except Exception as exc:
+                            voice_state["error"] = exc
+                            finish_voice_capture()
+                    else:
+                        finish_voice_capture()
+                else:
+                    voice_state["phase"] = "idle"
+                    if voice_state["error"] is not None:
+                        voice_results.put((None, voice_state["error"]))
+                    elif voice_state["samples"] is not None:
+                        threading.Thread(
+                            target=transcribe_voice,
+                            args=(voice_state["samples"],),
+                            daemon=True,
+                        ).start()
+                    voice_state["samples"] = None
+                    voice_state["error"] = None
+            try:
+                transcript, voice_error = voice_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if voice_error is not None:
+                    menu_action[0] = "voice_apology"
+                else:
+                    voice_action = interpret_voice_command(transcript)
+                    if voice_action in ("tunnel", "eye"):
+                        minigame_action[0] = voice_action
+                    else:
+                        menu_action[0] = voice_action or "voice_apology"
             if pet.tick():
                 disappointment_sound.play()
                 for need_name in tuple(pet_notifications):
@@ -1004,12 +1104,23 @@ def main() -> None:
             for event in pygame.event.get():
                 if event.type in (pygame.WINDOWSHOWN, pygame.WINDOWRESTORED):
                     keep_sdl_window_above(window)
+                elif event.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
+                    voice_keys_down.clear()
+                    if voice_state["phase"] in ("arming", "listening"):
+                        finish_voice_capture()
                 elif event.type in (pygame.QUIT, getattr(pygame, "WINDOWCLOSE", -1)):
                     if not goodbye_running:
                         menu_action[0] = "goodbye"
                 elif event.type == pygame.DROPFILE:
                     queue_pet_drop(event.file)
                 elif event.type == pygame.KEYDOWN:
+                    if (event.key in voice_control_keys or event.key in voice_shift_keys
+                            or event.key == pygame.K_l):
+                        voice_keys_down.add(event.key)
+                        if voice_state["phase"] == "idle" and voice_chord_held():
+                            voice_state["samples"] = None
+                            voice_state["error"] = None
+                            begin_voice_beeps("arming")
                     if (event.key == pygame.K_KP_MULTIPLY
                             or getattr(event, "unicode", "") == "*"
                             or (event.key == pygame.K_8 and event.mod & pygame.KMOD_SHIFT)):
@@ -1049,6 +1160,10 @@ def main() -> None:
                         chord_latched = True
                         skip_requested = True
                 elif event.type == pygame.KEYUP:
+                    voice_keys_down.discard(event.key)
+                    if (voice_state["phase"] in ("arming", "listening")
+                            and not voice_chord_held()):
+                        finish_voice_capture()
                     if event.key in (pygame.K_8, pygame.K_KP_MULTIPLY):
                         star_down = False
                     if event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -1199,7 +1314,40 @@ def main() -> None:
 
             selected_action = menu_action[0]
             menu_action[0] = None
-            if selected_action == "goodbye" and not goodbye_running:
+            if selected_action == "voice_apology":
+                audio.stop()
+                if pet_video is not None:
+                    finish_pet_alert()
+                    pet_video = None
+                if eye_event is not None:
+                    try:
+                        close_notification(Gio, GLib, eye_notification)
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    eye_notification = None
+                    eye_event = None
+                    if not eye_manual:
+                        next_eye_at = time.monotonic() + random_delay(
+                            preferences["playfulness"], 25, 75
+                        )
+                    eye_manual = False
+                idle_playing = False
+                move_tween = None
+                post_greeting_tween = None
+                greeting_tween_started = True
+                is_greeting = False
+                (
+                    audio, frame_surface, last_frame_surface, process,
+                    frames, stop, reader, video,
+                ) = start_apology(
+                    ffmpeg, temp_dir, video_texture, process, stop, reader
+                )
+                started = time.monotonic()
+                consumed = 0
+                finished = False
+                frame_dirty = False
+                random_events_ready_at = time.monotonic() + 10
+            elif selected_action == "goodbye" and not goodbye_running:
                 goodbye_running = True
                 audio.stop()
                 try:
