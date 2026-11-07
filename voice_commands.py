@@ -1,7 +1,10 @@
 import json
+import mmap
 import os
 import re
+import shutil
 import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -12,6 +15,16 @@ from pygame._sdl2 import AUDIO_S16, AudioDevice, get_audio_device_names
 
 SAMPLE_RATE = 16000
 MAX_RECORDING_BYTES = SAMPLE_RATE * 2 * 30
+try:
+    VOSK_THREADS = max(1, min(8, int(os.environ.get(
+        "MARIOASSISTANT_VOSK_THREADS",
+        str(min(4, os.cpu_count() or 1)),
+    ))))
+except ValueError:
+    VOSK_THREADS = max(1, min(4, os.cpu_count() or 1))
+os.environ.setdefault("OMP_NUM_THREADS", str(VOSK_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(VOSK_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(VOSK_THREADS))
 
 
 def create_beep_sound(pygame):
@@ -76,11 +89,95 @@ class SpeechTranscriber:
             "vosk_smart": assets_dir / "vosksmart",
         }
         self.models = {}
+        self.model_locks = {
+            "vosk_quick": threading.Lock(),
+            "vosk_smart": threading.Lock(),
+        }
         self.failed_models = set()
         self.last_engine = None
-        self.lock = threading.Lock()
         self.google_checked_at = 0.0
         self.google_is_online = False
+        self.gpu_enabled = False
+
+    def initialize_gpu(self):
+        if not self.preferences.get("speech_enable_vosk", True):
+            return False
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi is None:
+            return False
+        try:
+            device_check = subprocess.run(
+                [nvidia_smi, "-L"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+            )
+        except Exception:
+            return False
+        if "GPU 0:" not in device_check.stdout:
+            return False
+        try:
+            import vosk
+        except Exception as exc:
+            print(
+                f"MarioAssistant voice: NVIDIA GPU found, but Vosk could not load: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        library_path = re.search(r"for '([^']+)'", repr(vosk._c))
+        cuda_backend = False
+        if library_path is not None:
+            path = Path(library_path.group(1))
+            if sys.platform.startswith("linux") and shutil.which("ldd"):
+                try:
+                    dependencies = subprocess.run(
+                        ["ldd", str(path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                        check=False,
+                    ).stdout.lower()
+                    cuda_backend = any(
+                        name in dependencies
+                        for name in ("libcudart", "libcublas", "libkaldi-cudamatrix")
+                    )
+                except Exception:
+                    cuda_backend = False
+            elif sys.platform == "win32":
+                try:
+                    with path.open("rb") as library_file:
+                        with mmap.mmap(library_file.fileno(), 0, access=mmap.ACCESS_READ) as library_data:
+                            cuda_backend = (
+                                b"cudart64_" in library_data
+                                and b"cublas64_" in library_data
+                            )
+                except (OSError, ValueError):
+                    cuda_backend = False
+        if not cuda_backend or not hasattr(vosk, "GpuInit"):
+            print(
+                "MarioAssistant voice: NVIDIA GPU found, but the installed Vosk library has no detected CUDA backend; using CPU recognition",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        try:
+            vosk.GpuInit()
+        except Exception as exc:
+            print(
+                f"MarioAssistant voice: Vosk GPU initialization failed; using CPU recognition: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        self.gpu_enabled = True
+        print(
+            "MarioAssistant voice: Vosk CUDA GPU acceleration enabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
 
     def _method_enabled(self, method):
         if method == "vosk_quick":
@@ -122,14 +219,26 @@ class SpeechTranscriber:
 
         if method in self.failed_models:
             raise RuntimeError("This Vosk model failed earlier in this session")
-        with self.lock:
+        if self.gpu_enabled:
+            try:
+                vosk.GpuThreadInit()
+            except Exception as exc:
+                self.gpu_enabled = False
+                print(
+                    f"MarioAssistant voice: Vosk GPU worker initialization failed; using CPU recognition: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        with self.model_locks[method]:
             model = self.models.get(method)
             if model is None:
                 vosk.SetLogLevel(-1)
                 model = vosk.Model(str(self.model_paths[method]))
                 self.models[method] = model
         recognizer = vosk.KaldiRecognizer(model, SAMPLE_RATE)
-        recognizer.AcceptWaveform(samples)
+        chunk_size = SAMPLE_RATE * 2
+        for offset in range(0, len(samples), chunk_size):
+            recognizer.AcceptWaveform(samples[offset:offset + chunk_size])
         transcript = json.loads(recognizer.FinalResult()).get("text", "").strip()
         if not transcript:
             raise ValueError("Vosk did not recognize speech")
@@ -245,18 +354,28 @@ def interpret_voice_command(transcript):
             return "quench_thirst"
     if "move" in words or contains("out of the way") or contains("out of my way"):
         return "move"
+    if "play" in words and "random" in words and ("minigame" in words or "minigames" in words):
+        return "random_minigame"
     if (
         "minigames" in words
         and ("open" in words or "interactive" in words or "mario" in words)
     ):
         return "minigames"
-    if ("play" in words or "mario" in words) and contains("tunnel of doom"):
+    if (
+        ("play" in words or "mario" in words)
+        and "tunnel" in words
+        and ("doom" in words or "do" in words or "doo" in words)
+    ):
         return "tunnel"
-    if ("play" in words or "mario" in words) and contains("something in my eye"):
+    if (
+        ("play" in words or "mario" in words)
+        and "something" in words
+        and "eye" in words
+    ):
         return "eye"
     if "debug" in words:
         return "superdebug"
-    if contains("mario's") or contains("pet care"):
+    if "pet" in words and "care" in words:
         return "petcare"
     if "settings" in words or "configure" in words:
         return "settings"

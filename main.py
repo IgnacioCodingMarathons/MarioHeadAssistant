@@ -223,13 +223,19 @@ def create_minigames_window(QtWidgets, minigame_action):
     game_list.addItem("Mario's Tunnel of Doom")
     game_list.setCurrentRow(0)
     play_button = QtWidgets.QPushButton("Play!")
+    roll_button = QtWidgets.QPushButton("Roll!")
+    game_actions = ("eye", "tunnel")
     play_button.clicked.connect(
         lambda: minigame_action.__setitem__(
-            0, "eye" if game_list.currentRow() == 0 else "tunnel"
+            0, game_actions[game_list.currentRow()]
         )
+    )
+    roll_button.clicked.connect(
+        lambda: game_list.setCurrentRow(random.randrange(game_list.count()))
     )
     layout.addWidget(game_list)
     layout.addWidget(play_button)
+    layout.addWidget(roll_button)
     return window
 
 
@@ -243,19 +249,19 @@ def create_voice_commands_window(QtCore, QtWidgets):
     content = QtWidgets.QWidget()
     content_layout = QtWidgets.QVBoxLayout(content)
     text = QtWidgets.QLabel(
-        "Say a trigger phrase to run its action:\n\n"
-        "‘stop’ / ‘shut up’ / ‘skip’ / ‘silence’ / ‘shut your mouth’ / ‘stop it’ — Stop Mario's current clip.\n\n"
-        "‘goodbye’ — Close Mario with his goodbye sequence.\n\n"
-        "‘move’ / ‘out of the way’ / ‘out of my way’ — Move Mario.\n\n"
-        "‘open’ and/or ‘interactive’ and/or ‘Mario’ + ‘minigames’ — Open the minigame picker.\n\n"
-        "‘play’ and/or ‘Mario’ + ‘Tunnel of Doom’ — Start Tunnel of Doom.\n\n"
-        "‘play’ and/or ‘Mario’ + ‘something in my eye’ — Start the eye minigame.\n\n"
-        "‘debug’ — Open Super Debug.\n\n"
-        "‘open’ and/or ‘Mario's’ and/or ‘pet care’ — Open Pet Care.\n\n"
-        "‘open’ and/or ‘settings’, or ‘configure’ — Open Settings.\n\n"
-        "‘speak’ / ‘say something’ — Play a random idle clip.\n\n"
-        "‘quench’ + (optional ‘Mario's’) + ‘hunger’ or ‘thirst’ — Choose files for that meter.\n\n"
-        "(optional ‘see’) (optional ‘Mario's’) ‘voice’ + ‘command’ or ‘commands’ + (optional ‘list’). Without ‘list’, you can say ‘to say’ or ‘to use’. — Show this list."
+        "Stop: ‘stop’, ‘shut up’, ‘skip’, ‘silence’, ‘shut your mouth’, or ‘stop it’.\n"
+        "Goodbye: ‘goodbye’.\n"
+        "Move: ‘move’, ‘out of the way’, or ‘out of my way’.\n"
+        "Open IM Minigames: ‘minigames’ with ‘open’, ‘interactive’, or ‘Mario’.\n"
+        "Play a random minigame: ‘play a random minigame’.\n"
+        "Play Tunnel of Doom: ‘play’ or ‘Mario’ with ‘Tunnel of Doom’.\n"
+        "Play the eye minigame: ‘play’ or ‘Mario’ with ‘something in my eye’.\n"
+        "Super Debug: ‘debug’.\n"
+        "Pet Care: ‘pet care’.\n"
+        "Settings: ‘settings’ or ‘configure’.\n"
+        "Speak: ‘speak’ or ‘say something’.\n"
+        "Quench hunger or thirst: ‘quench’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
+        "Show this list: ‘voice command’ or ‘voice commands’; optionally add ‘see’ and ‘Mario’s’, then ‘list’, ‘to say’, or ‘to use’."
     )
     text.setWordWrap(True)
     text.setTextFormat(QtCore.Qt.TextFormat.PlainText)
@@ -891,6 +897,7 @@ def main() -> None:
         voice_beep_sound = create_beep_sound(pygame)
         voice_beep_channel = pygame.mixer.Channel(7)
         voice_transcriber = SpeechTranscriber(ASSETS, preferences)
+        voice_transcriber.initialize_gpu()
         voice_results = queue.Queue()
         voice_processing = False
         voice_animation_deadline = 0.0
@@ -1008,6 +1015,17 @@ def main() -> None:
         window_move_changed_at = None
         tray_update = None
         minigame_action = [None]
+        random_minigame_notification = [None]
+
+        def queue_random_minigame():
+            selected = random.choice(("eye", "tunnel"))
+            minigame_action[0] = selected
+            random_minigame_notification[0] = (
+                "Hey, I Got Something In My Eye"
+                if selected == "eye"
+                else "Mario's Tunnel of Doom"
+            )
+
         minigames_window = None
         voice_commands_window = None
         debug_window = None
@@ -1146,6 +1164,8 @@ def main() -> None:
                     else:
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
+                        elif voice_action == "random_minigame":
+                            queue_random_minigame()
                         elif voice_action is not None:
                             menu_action[0] = voice_action
                         else:
@@ -1162,6 +1182,8 @@ def main() -> None:
                     else:
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
+                        elif voice_action == "random_minigame":
+                            queue_random_minigame()
                         else:
                             menu_action[0] = voice_action or "voice_apology"
             if voice_processing and not voice_animation_done and now >= voice_animation_deadline:
@@ -1632,6 +1654,17 @@ def main() -> None:
 
             if minigame_action[0] == "tunnel":
                 minigame_action[0] = None
+                if random_minigame_notification[0] is not None:
+                    try:
+                        send_notification(
+                            Gio,
+                            GLib,
+                            title="Hey!",
+                            body=f"I'ma pick {random_minigame_notification[0]} just for you!",
+                        )
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    random_minigame_notification[0] = None
                 finish_pet_alert()
                 pet_video = None
                 if eye_event is not None:
@@ -1769,6 +1802,18 @@ def main() -> None:
 
             manual_start = minigame_action[0] == "eye"
             minigame_action[0] = None
+            if manual_start and eye_event is not None:
+                try:
+                    close_notification(Gio, GLib, eye_notification)
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                eye_notification = None
+                eye_event = None
+                if not eye_manual:
+                    next_eye_at = time.monotonic() + random_delay(
+                        preferences["playfulness"], 25, 75
+                    )
+                eye_manual = False
             now = time.monotonic()
             if not super_zen_mode:
                 if eye_event is None:
@@ -1815,6 +1860,17 @@ def main() -> None:
                 automatic_start and earliest_event == "eye" and finished and not idle_playing and move_tween is None
                 and time.monotonic() >= random_events_ready_at
             )):
+                if random_minigame_notification[0] is not None:
+                    try:
+                        send_notification(
+                            Gio,
+                            GLib,
+                            title="Hey!",
+                            body=f"I'ma pick {random_minigame_notification[0]} just for you!",
+                        )
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    random_minigame_notification[0] = None
                 if idle_playing:
                     idle_playing = False
                     next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
