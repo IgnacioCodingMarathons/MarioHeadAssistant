@@ -18,7 +18,14 @@ from pygame._sdl2 import Renderer, Texture, Window
 
 from tunnel_of_doom import play_tunnel_of_doom
 from settings_window import DEFAULT_SETTINGS, create_settings_window, random_delay, idle_delay
-from desktop_support import DesktopNotifications, play_error_sound, play_information_sound
+from desktop_support import (
+    DesktopNotifications,
+    get_system_volume,
+    play_error_sound,
+    play_information_sound,
+    set_system_volume,
+    speak_text,
+)
 from window_policy import (
     install_linux_window_policy,
     keep_sdl_window_above,
@@ -265,7 +272,11 @@ def create_voice_commands_window(QtCore, QtWidgets):
         "Speak: ‘speak’ or ‘say something’.\n"
         "Oh, sorry!: ‘I didn’t say your name’ or ‘I didn’t call you’.\n"
         "Volume: ‘set volume to’, ‘lower volume by’, or ‘increase volume by’ with a number from 0 to 100; optionally add ‘percent’.\n"
-        "Quench hunger or thirst: ‘quench’ or ‘clinch’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
+        "Current volume: ‘what’s the volume’, ‘what’s the current volume’, or ‘what is the volume’ (optionally ‘current’).\n"
+        "Repeat the last request: ‘what did you hear’ or ‘what’d you hear’.\n"
+        "Time: ‘what’s the time’, ‘what is the time’, or ‘what time is it’.\n"
+        "Date: ‘what day is it’.\n"
+        "Quench hunger or thirst: ‘quench’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
         "Show this list: ‘voice command’ or ‘voice commands’; optionally add ‘see’ and ‘Mario’s’, then ‘list’, ‘to say’, or ‘to use’."
     )
     text.setWordWrap(True)
@@ -927,6 +938,7 @@ def main() -> None:
         voice_request_pending = False
         voice_request_active = False
         voice_request_action = None
+        last_heard_query = None
         voice_animation_deadline = 0.0
         voice_animation_done = False
         voice_keys_down = set()
@@ -1292,6 +1304,8 @@ def main() -> None:
             except queue.Empty:
                 pass
             else:
+                if transcript and voice_action != "what_heard":
+                    last_heard_query = transcript
                 if voice_processing:
                     voice_processing = False
                     audio.stop()
@@ -1682,22 +1696,28 @@ def main() -> None:
                 if process is not None and process.poll() is None:
                     process.terminate()
                 audio.stop()
-                frame_surface = last_frame_surface
-                frame_dirty = True
                 if idle_playing:
                     idle_playing = False
                     next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
+                    frame_surface = greeting_first_surface
+                    last_frame_surface = greeting_first_surface
+                else:
+                    frame_surface = last_frame_surface
+                frame_dirty = True
                 if eye_event is not None:
-                    try:
-                        close_notification(Gio, GLib, eye_notification)
-                    except Exception as exc:
-                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
-                    eye_notification = None
-                    disappointment_sound.play()
-                    eye_event = None
-                    if not eye_manual:
-                        next_eye_at = time.monotonic() + random_delay(preferences["playfulness"], 25, 75)
-                    eye_manual = False
+                    if zen_mode and not eye_manual:
+                        collect_eye = True
+                    else:
+                        try:
+                            close_notification(Gio, GLib, eye_notification)
+                        except Exception as exc:
+                            print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                        eye_notification = None
+                        disappointment_sound.play()
+                        eye_event = None
+                        if not eye_manual:
+                            next_eye_at = time.monotonic() + random_delay(preferences["playfulness"], 25, 75)
+                        eye_manual = False
 
             if (zen_mode and eye_event is not None and not eye_manual
                     and time.monotonic() - eye_event >= 2.75):
@@ -1772,23 +1792,46 @@ def main() -> None:
                     print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                     voice_unrecognized_notification_id = None
                     voice_unrecognized_notification_close_at = None
+            elif selected_action == "volume_query":
+                volume_percent = get_system_volume()
+                if volume_percent is None:
+                    print("MarioAssistant volume: couldn't read the system output volume", file=sys.stderr)
+                else:
+                    speak_text(f"The volume is set to {volume_percent} percent")
+            elif selected_action == "what_heard":
+                heard_text = last_heard_query or "I haven't heard a command yet"
+                speak_text(f'I heard: "{heard_text}"')
+            elif selected_action == "time_query":
+                current_time = datetime.now().strftime("%I:%M %p").lstrip("0")
+                speak_text(f"It's {current_time}")
+            elif selected_action == "date_query":
+                current_date = datetime.now()
+                day = current_date.day
+                suffix = "th" if 11 <= day % 100 <= 13 else {
+                    1: "st", 2: "nd", 3: "rd",
+                }.get(day % 10, "th")
+                speak_text(
+                    f"Today's {current_date.strftime('%A')}, "
+                    f"{current_date.strftime('%B')} {day}{suffix}, "
+                    f"{current_date.year}"
+                )
             elif selected_action is not None and selected_action.startswith("volume_"):
                 operation, amount_text = selected_action.removeprefix("volume_").split(":", 1)
                 amount = float(amount_text)
-                current_volume = MARIO_VOLUME * 100
-                if operation == "set":
-                    new_volume = amount
-                elif operation == "lower":
-                    new_volume = current_volume - amount
+                current_volume = get_system_volume()
+                if current_volume is None:
+                    print("MarioAssistant volume: couldn't read the system output volume", file=sys.stderr)
                 else:
-                    new_volume = current_volume + amount
-                MARIO_VOLUME = max(0.0, min(100.0, new_volume)) / 100
-                for sound in (
-                    audio, disappointment_sound, kaching_sound,
-                    eating_sound, voice_beep_sound,
-                ):
-                    sound.set_volume(MARIO_VOLUME)
-                play_information_sound(QtWidgets)
+                    if operation == "set":
+                        new_volume = amount
+                    elif operation == "lower":
+                        new_volume = current_volume - amount
+                    else:
+                        new_volume = current_volume + amount
+                    if set_system_volume(new_volume):
+                        play_information_sound(QtWidgets)
+                    else:
+                        print("MarioAssistant volume: couldn't change the system output volume", file=sys.stderr)
             elif selected_action in ("voice_apology", "ohsorry"):
                 audio.stop()
                 if pet_video is not None:
@@ -2280,6 +2323,12 @@ def main() -> None:
                         if video == ASSETS / "ohsorry.mp4":
                             frame_surface = greeting_first_surface
                         if eye_event is not None:
+                            if zen_mode and not eye_manual:
+                                collect_eye = True
+                                frame_surface = greeting_first_surface
+                                last_frame_surface = greeting_first_surface
+                                frame_dirty = True
+                                break
                             audio.stop()
                             try:
                                 close_notification(Gio, GLib, eye_notification)

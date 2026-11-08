@@ -52,6 +52,120 @@ def play_error_sound(QtWidgets):
         QtWidgets.QApplication.beep()
 
 
+def speak_text(text):
+    if sys.platform == 'win32':
+        script = "$text = [Console]::In.ReadToEnd(); Add-Type -AssemblyName System.Speech; $speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; $speaker.Speak($text)"
+        process = subprocess.Popen(
+            ['powershell', '-NoProfile', '-Command', script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        process.stdin.write(text)
+        process.stdin.close()
+        return True
+    if sys.platform == 'darwin':
+        player = shutil.which('say')
+        command = [player, text] if player else None
+    else:
+        player = shutil.which('spd-say') or shutil.which('espeak-ng') or shutil.which('espeak')
+        command = [player, text] if player else None
+    if not command:
+        return False
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def get_system_volume():
+    if sys.platform == 'win32':
+        try:
+            from pycaw.pycaw import AudioUtilities
+            device = AudioUtilities.GetSpeakers()
+            interface = device.EndpointVolume
+            return round(interface.GetMasterVolumeLevelScalar() * 100)
+        except Exception:
+            return None
+    if sys.platform == 'darwin':
+        try:
+            result = subprocess.run(
+                ['osascript', '-e', 'output volume of (get volume settings)'],
+                capture_output=True, text=True, check=True, timeout=3,
+            )
+            return max(0, min(100, int(result.stdout.strip())))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+    wpctl = shutil.which('wpctl')
+    if wpctl:
+        try:
+            result = subprocess.run(
+                [wpctl, 'get-volume', '@DEFAULT_AUDIO_SINK@'],
+                capture_output=True, text=True, check=True, timeout=3,
+            )
+            return max(0, min(100, round(float(result.stdout.split()[1]) * 100)))
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+    pactl = shutil.which('pactl')
+    if pactl:
+        try:
+            result = subprocess.run(
+                [pactl, 'get-sink-volume', '@DEFAULT_SINK@'],
+                capture_output=True, text=True, check=True, timeout=3,
+            )
+            import re
+            match = re.search(r'(\d+)%', result.stdout)
+            if match:
+                return max(0, min(100, int(match.group(1))))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def set_system_volume(percent):
+    percent = max(0, min(100, round(percent)))
+    if sys.platform == 'win32':
+        try:
+            from pycaw.pycaw import AudioUtilities
+            device = AudioUtilities.GetSpeakers()
+            device.EndpointVolume.SetMasterVolumeLevelScalar(percent / 100, None)
+            return True
+        except Exception:
+            return False
+    if sys.platform == 'darwin':
+        try:
+            subprocess.run(
+                ['osascript', '-e', f'set volume output volume {percent}'],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+    wpctl = shutil.which('wpctl')
+    if wpctl:
+        try:
+            subprocess.run(
+                [wpctl, 'set-volume', '@DEFAULT_AUDIO_SINK@', f'{percent / 100:.2f}'],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    pactl = shutil.which('pactl')
+    if pactl:
+        try:
+            subprocess.run(
+                [pactl, 'set-sink-volume', '@DEFAULT_SINK@', f'{percent}%'],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
 class DesktopNotifications:
     def __init__(self, QtWidgets):
         self.tray = QtWidgets.QSystemTrayIcon(

@@ -644,6 +644,7 @@ class WakeWordListener:
 
 def interpret_voice_command(transcript):
     text = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    text = re.sub(r"\bdid\s+not\b", "didn't", text)
     words = set(text.split())
 
     def contains(phrase):
@@ -655,13 +656,23 @@ def interpret_voice_command(transcript):
         return "stop"
     if contains("goodbye"):
         return "goodbye"
+    if (contains("what did you hear") or contains("what'd you hear")):
+        return "what_heard"
+    if (
+        (
+            contains("what's the time")
+            or contains("what is the time")
+            or contains("what time is it")
+        )
+    ):
+        return "time_query"
+    if contains("what day is it"):
+        return "date_query"
     if any(contains(phrase) for phrase in (
         "i didn't say your name",
-        "i did not say your name",
         "i didnt say your name",
         "i didn t say your name",
         "i didn't call you",
-        "i did not call you",
         "i didnt call you",
         "i didn t call you",
     )):
@@ -676,6 +687,8 @@ def interpret_voice_command(transcript):
             amount = parse_voice_number(text[len(prefix):])
             if amount is not None:
                 return f"volume_{operation}:{amount}"
+    if re.fullmatch(r"(?:what's|what is) the (?:current )?volume", text):
+        return "volume_query"
     if "speak" in words or contains("say something"):
         return "speak"
     if "voice" in words and ("command" in words or "commands" in words):
