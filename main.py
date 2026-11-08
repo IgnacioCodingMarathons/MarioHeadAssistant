@@ -831,6 +831,7 @@ def main() -> None:
         initial_save, difficulty=preferences["caring_difficulty"]
     )
     pet_drops = []
+    feeding_queue = []
 
     def queue_pet_drop(filename, drop_x=None):
         if drop_x is None:
@@ -881,6 +882,7 @@ def main() -> None:
     zen_chord_latched = False
     super_zen_chord_latched = False
     finished = False
+    feeding_active = False
     frame_surface = None
     frame_dirty = False
     try:
@@ -957,6 +959,19 @@ def main() -> None:
         audio = pygame.mixer.Sound(str(audio_path))
         disappointment_sound = pygame.mixer.Sound(str(ASSETS / "disappointment.wav"))
         kaching_sound = pygame.mixer.Sound(str(ASSETS / "kaching.wav"))
+        eating_audio_path = Path(temp_dir.name) / "eating.wav"
+        subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i",
+             str(ASSETS / "eating.mp3"), "-vn", "-ac", "2", "-ar", "44100",
+             "-c:a", "pcm_s16le", str(eating_audio_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+        eating_sound = pygame.mixer.Sound(str(eating_audio_path))
+        pygame.mixer.set_reserved(1)
+        eating_channel = pygame.mixer.Channel(0)
+        eating_video = ASSETS / "goodjoke.avi"
+        eating_first_surface = decode_first_frame(ffmpeg, eating_video)
+        eating_last_surface = decode_last_frame(ffmpeg, eating_video)
 
         frame_surface = decode_first_frame(ffmpeg, video)
         last_frame_surface = decode_last_frame(ffmpeg, video)
@@ -1384,15 +1399,20 @@ def main() -> None:
                     pet_notification_close_at.pop(fed, None)
                     if pet_alert_need == fed:
                         pet_alert_need = None
-                if pet_video is not None:
-                    audio.stop()
-                    stop_decoder(process, stop, reader)
-                    finish_pet_alert()
-                    pet_video = None
-                    finished = True
-                    frame_surface = greeting_first_surface
-                    frame_dirty = True
-                    random_events_ready_at = time.monotonic() + 10
+                feeding_queue.append(fed)
+            pet_drops.clear()
+
+            if feeding_active and not eating_channel.get_busy():
+                stop_decoder(process, stop, reader)
+                process = None
+                reader = None
+                feeding_active = False
+                finished = True
+                video = ASSETS / "greeting.avi"
+                frame_surface = greeting_first_surface
+                last_frame_surface = greeting_first_surface
+                frame_dirty = True
+                random_events_ready_at = time.monotonic() + 10
                 previous_mariocoins = mariocoins
                 mariocoins += 50
                 live_values["mariocoins"] = mariocoins
@@ -1402,7 +1422,44 @@ def main() -> None:
                 show_coin_change(QtCore, QtWidgets, previous_mariocoins, mariocoins)
                 if debug_update is not None:
                     debug_update("mariocoins")
-            pet_drops.clear()
+
+            if feeding_queue and not feeding_active:
+                feeding_queue.pop(0)
+                audio.stop()
+                if idle_playing:
+                    idle_playing = False
+                    next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
+                if pet_video is not None:
+                    finish_pet_alert()
+                    pet_video = None
+                if eye_event is not None:
+                    try:
+                        close_notification(Gio, GLib, eye_notification)
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    eye_notification = None
+                    eye_event = None
+                    if not eye_manual:
+                        next_eye_at = time.monotonic() + random_delay(
+                            preferences["playfulness"], 25, 75
+                        )
+                    eye_manual = False
+                stop_decoder(process, stop, reader)
+                frame_surface = eating_first_surface
+                last_frame_surface = eating_last_surface
+                video_texture.update(eating_first_surface)
+                process, frames, stop, reader = start_decoder(ffmpeg, eating_video)
+                video = eating_video
+                started = time.monotonic()
+                consumed = 0
+                finished = False
+                frame_dirty = True
+                feeding_active = True
+                post_greeting_tween = None
+                move_tween = None
+                greeting_tween_started = True
+                is_greeting = False
+                eating_channel.play(eating_sound)
 
             for need_name, deadline in tuple(pet_notification_close_at.items()):
                 if time.monotonic() >= deadline:
@@ -1420,6 +1477,10 @@ def main() -> None:
             if skip_requested or menu_action[0] == "stop":
                 if menu_action[0] == "stop":
                     menu_action[0] = None
+                if feeding_active or feeding_queue:
+                    eating_channel.stop()
+                    feeding_active = False
+                    feeding_queue.clear()
                 collect_eye = False
                 finish_pet_alert()
                 pet_video = None
@@ -1485,6 +1546,13 @@ def main() -> None:
 
             selected_action = menu_action[0]
             menu_action[0] = None
+            if feeding_active and (
+                selected_action in ("speak", "voice_apology", "goodbye")
+                or minigame_action[0] is not None
+            ):
+                eating_channel.stop()
+                feeding_active = False
+                feeding_queue.clear()
             if selected_action == "voice_apology":
                 audio.stop()
                 if pet_video is not None:
@@ -1769,7 +1837,7 @@ def main() -> None:
                 frame_dirty = False
                 is_greeting = False
                 greeting_tween_started = True
-            elif (due_need is not None and finished and eye_event is None
+            elif (due_need is not None and finished and not feeding_active and eye_event is None
                     and move_tween is None and post_greeting_tween is None
                     and minigame_action[0] is None):
                 audio.stop()
@@ -1857,7 +1925,7 @@ def main() -> None:
                 next_eye_at = time.monotonic() + random_delay(preferences["playfulness"], 25, 75)
                 automatic_start = False
             if eye_event is None and (manual_start or (
-                automatic_start and earliest_event == "eye" and finished and not idle_playing and move_tween is None
+                automatic_start and earliest_event == "eye" and finished and not feeding_active and not idle_playing and move_tween is None
                 and time.monotonic() >= random_events_ready_at
             )):
                 if random_minigame_notification[0] is not None:
@@ -1905,7 +1973,7 @@ def main() -> None:
             if idle_due and super_zen_mode and not idle_playing:
                 next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
                 idle_due = False
-            if (idle_due and earliest_event == "idle" and eye_event is None and not idle_playing and finished and move_tween is None
+            if (idle_due and earliest_event == "idle" and eye_event is None and not feeding_active and not idle_playing and finished and move_tween is None
                     and time.monotonic() >= random_events_ready_at):
                 idle_video = random.choice(IDLE_VIDEOS)
                 audio.stop()
@@ -2063,7 +2131,7 @@ def main() -> None:
                         frame_dirty = False
 
             if (time.monotonic() >= next_wander_at and earliest_event == "wander" and preferences["wandering"] > 0
-                    and not super_zen_mode and finished and eye_event is None and post_greeting_tween is None
+                    and not super_zen_mode and finished and not feeding_active and eye_event is None and post_greeting_tween is None
                     and move_tween is None and time.monotonic() >= random_events_ready_at):
                 screens = qt_app.screens()
                 screen = screens[min(window.display_index, len(screens) - 1)]
@@ -2083,7 +2151,7 @@ def main() -> None:
                 window_move_changed_at = None
 
             current_position = tuple(window.position)
-            if (greeting_tween_started and post_greeting_tween is None
+            if (not feeding_active and greeting_tween_started and post_greeting_tween is None
                     and move_tween is None):
                 if current_position != last_window_position:
                     window_move_changed_at = time.monotonic()
