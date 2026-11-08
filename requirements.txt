@@ -3,3 +3,4 @@ PySide6>=6.12.0
 screen-brightness-control; sys_platform == "win32"
 vosk>=0.3.45
 SpeechRecognition>=3.14.0
+pocketsphinx>=5.0.4

@@ -19,6 +19,8 @@ DEFAULT_SETTINGS = {
     'speech_enable_vosk': True,
     'speech_enable_smart_vosk': False,
     'speech_enable_google': True,
+    'speech_enable_wake_word': True,
+    'wake_word_sensitivity': 5,
 }
 
 
@@ -99,6 +101,21 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
         'It is recommended to use smart Vosk only if you have a mid-range to '
         'powerful computer so that it takes less time to process.'
     ))
+    enable_wake_word = QtWidgets.QCheckBox('Enable wake word ("Hey Mario Head")')
+    enable_wake_word.setChecked(values.get('speech_enable_wake_word', True))
+    speech_layout.addWidget(enable_wake_word)
+    speech_layout.addWidget(QtWidgets.QLabel('Wake word sensitivity'))
+    wake_sensitivity_row = QtWidgets.QWidget()
+    wake_sensitivity_layout = QtWidgets.QHBoxLayout(wake_sensitivity_row)
+    wake_sensitivity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+    wake_sensitivity.setObjectName('wake_word_sensitivity')
+    wake_sensitivity.setRange(0, 10)
+    wake_sensitivity.setValue(int(values.get('wake_word_sensitivity', 5)))
+    wake_sensitivity_value = QtWidgets.QLabel(str(wake_sensitivity.value()))
+    enable_wake_word.setEnabled(wake_sensitivity.value() > 0)
+    wake_sensitivity_layout.addWidget(wake_sensitivity)
+    wake_sensitivity_layout.addWidget(wake_sensitivity_value)
+    speech_layout.addWidget(wake_sensitivity_row)
     use_one_method = QtWidgets.QCheckBox('Use one method only')
     use_one_method.setChecked(values['speech_use_one_method_only'])
     speech_layout.addWidget(use_one_method)
@@ -151,6 +168,8 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
         'speech_enable_vosk': enable_vosk,
         'speech_enable_smart_vosk': enable_smart_vosk,
         'speech_enable_google': enable_google,
+        'speech_enable_wake_word': enable_wake_word,
+        'wake_word_sensitivity': wake_sensitivity,
     })
     google_online = [False]
 
@@ -237,6 +256,22 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
     )
     enable_google.toggled.connect(
         lambda value: primary_method_changed('speech_enable_google', value)
+    )
+    enable_wake_word.toggled.connect(
+        lambda value: changed('speech_enable_wake_word', value)
+    )
+
+    def update_wake_sensitivity(value):
+        wake_sensitivity_value.setText(str(value))
+        if value == 0 and enable_wake_word.isChecked():
+            enable_wake_word.setChecked(False)
+        enable_wake_word.setEnabled(value > 0)
+        if not wake_sensitivity.isSliderDown():
+            changed('wake_word_sensitivity', value)
+
+    wake_sensitivity.valueChanged.connect(update_wake_sensitivity)
+    wake_sensitivity.sliderReleased.connect(
+        lambda: changed('wake_word_sensitivity', wake_sensitivity.value())
     )
     preferred_method.currentIndexChanged.connect(
         lambda index: changed(

@@ -18,7 +18,7 @@ from pygame._sdl2 import Renderer, Texture, Window
 
 from tunnel_of_doom import play_tunnel_of_doom
 from settings_window import DEFAULT_SETTINGS, create_settings_window, random_delay, idle_delay
-from desktop_support import DesktopNotifications, play_information_sound
+from desktop_support import DesktopNotifications, play_error_sound, play_information_sound
 from window_policy import (
     install_linux_window_policy,
     keep_sdl_window_above,
@@ -28,6 +28,7 @@ from pet_care import PetNeeds, create_pet_care_window
 from voice_commands import (
     MicrophoneCapture,
     SpeechTranscriber,
+    WakeWordListener,
     create_beep_sound,
 )
 
@@ -260,7 +261,8 @@ def create_voice_commands_window(QtCore, QtWidgets):
         "Pet Care: ‘pet care’.\n"
         "Settings: ‘settings’ or ‘configure’.\n"
         "Speak: ‘speak’ or ‘say something’.\n"
-        "Quench hunger or thirst: ‘quench’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
+        "Oh, sorry!: ‘I didn’t say your name’ or ‘I didn’t call you’.\n"
+        "Quench hunger or thirst: ‘quench’ or ‘clinch’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
         "Show this list: ‘voice command’ or ‘voice commands’; optionally add ‘see’ and ‘Mario’s’, then ‘list’, ‘to say’, or ‘to use’."
     )
     text.setWordWrap(True)
@@ -535,9 +537,9 @@ def show_full_meter_message(meter, hunger, thirst):
     root.destroy()
 
 
-def send_notification(Gio, GLib, notification_id=0, title="Hey!", body="I got something in my eye, can you help me get it out?"):
+def send_notification(Gio, GLib, notification_id=0, title="Hey!", body="I got something in my eye, can you help me get it out?", expire_timeout=0):
     if Gio is None:
-        return NOTIFICATIONS.show(title, body)
+        return NOTIFICATIONS.show(title, body, expire_timeout if expire_timeout > 0 else 60000)
     connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     parameters = GLib.Variant(
         "(susssasa{sv}i)",
@@ -552,7 +554,7 @@ def send_notification(Gio, GLib, notification_id=0, title="Hey!", body="I got so
                 "desktop-entry": GLib.Variant("s", "MarioAssistant"),
                 "sound-name": GLib.Variant("s", "message-new-instant"),
             },
-            0,
+            expire_timeout,
         ),
     )
     result = connection.call_sync(
@@ -819,14 +821,23 @@ def main() -> None:
         if method not in speech_order
     )
     preferences["speech_method_order"] = speech_order
+    try:
+        preferences["wake_word_sensitivity"] = max(
+            0, min(10, int(preferences["wake_word_sensitivity"]))
+        )
+    except (TypeError, ValueError):
+        preferences["wake_word_sensitivity"] = 5
     if (not isinstance(preferences.get("speech_preferred_method"), str)
             or preferences["speech_preferred_method"] not in speech_methods):
         preferences["speech_preferred_method"] = "google"
     for name in (
         "speech_use_one_method_only", "speech_enable_vosk",
         "speech_enable_smart_vosk", "speech_enable_google",
+        "speech_enable_wake_word",
     ):
         preferences[name] = bool(preferences[name])
+    if preferences["wake_word_sensitivity"] == 0:
+        preferences["speech_enable_wake_word"] = False
     pet = PetNeeds(
         initial_save, difficulty=preferences["caring_difficulty"]
     )
@@ -901,7 +912,18 @@ def main() -> None:
         voice_transcriber = SpeechTranscriber(ASSETS, preferences)
         voice_transcriber.initialize_gpu()
         voice_results = queue.Queue()
+        wake_events = queue.Queue()
+        wake_listener = WakeWordListener(voice_transcriber, wake_events)
+
+        def start_wake_listener():
+            if (preferences.get("speech_enable_wake_word", True)
+                    and preferences.get("wake_word_sensitivity", 5) > 0):
+                wake_listener.start()
         voice_processing = False
+        voice_silence_mode = False
+        voice_request_pending = False
+        voice_request_active = False
+        voice_request_action = None
         voice_animation_deadline = 0.0
         voice_animation_done = False
         voice_keys_down = set()
@@ -914,6 +936,7 @@ def main() -> None:
             "capture": None,
             "samples": None,
             "error": None,
+            "automatic": False,
         }
 
         def voice_chord_held():
@@ -925,6 +948,7 @@ def main() -> None:
             )
 
         def begin_voice_beeps(phase):
+            voice_beep_channel.stop()
             voice_state["phase"] = phase
             voice_state["step"] = 0
             voice_state["deadline"] = time.monotonic() + 0.25
@@ -941,6 +965,7 @@ def main() -> None:
                     voice_state["capture"] = None
             else:
                 voice_state["samples"] = None
+            voice_state["automatic"] = False
             begin_voice_beeps("finishing")
 
         def transcribe_voice(samples):
@@ -1031,6 +1056,10 @@ def main() -> None:
         tray_update = None
         minigame_action = [None]
         random_minigame_notification = [None]
+        random_minigame_notification_id = None
+        random_minigame_notification_close_at = None
+        voice_unrecognized_notification_id = None
+        voice_unrecognized_notification_close_at = None
 
         def queue_random_minigame():
             selected = random.choice(("eye", "tunnel"))
@@ -1057,9 +1086,71 @@ def main() -> None:
             if pet_alert_need is not None:
                 pet_notification_close_at[pet_alert_need] = time.monotonic() + 7.5
                 pet_alert_need = None
+
+        def suspend_media_for_voice():
+            nonlocal audio, process, reader, stop, frames, video, finished
+            nonlocal frame_surface, last_frame_surface, frame_dirty, idle_playing
+            nonlocal next_idle_at, pet_video, eye_event, eye_notification, eye_manual
+            nonlocal next_eye_at, random_events_ready_at, feeding_active
+            nonlocal post_greeting_tween, move_tween, greeting_tween_started, is_greeting
+            nonlocal voice_silence_mode
+            voice_silence_mode = True
+            pygame.mixer.stop()
+            eating_channel.stop()
+            feeding_active = False
+            feeding_queue.clear()
+            audio.stop()
+            stop_decoder(process, stop, reader)
+            process = None
+            reader = None
+            stop = threading.Event()
+            frames = queue.Queue()
+            finished = True
+            if idle_playing:
+                idle_playing = False
+                next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
+            if pet_video is not None:
+                finish_pet_alert()
+                pet_video = None
+            if eye_event is not None:
+                try:
+                    close_notification(Gio, GLib, eye_notification)
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                eye_notification = None
+                eye_event = None
+                if not eye_manual:
+                    next_eye_at = time.monotonic() + random_delay(
+                        preferences["playfulness"], 25, 75
+                    )
+                eye_manual = False
+            frame_surface = greeting_first_surface
+            last_frame_surface = greeting_first_surface
+            video_texture.update(greeting_first_surface)
+            frame_dirty = True
+            video = ASSETS / "greeting.avi"
+            random_events_ready_at = max(
+                random_events_ready_at, time.monotonic() + 10
+            )
+            post_greeting_tween = None
+            move_tween = None
+            greeting_tween_started = True
+            is_greeting = False
+
+        def finish_voice_request():
+            nonlocal voice_silence_mode, voice_request_pending
+            nonlocal voice_request_active, voice_request_action
+            voice_silence_mode = False
+            voice_request_pending = False
+            voice_request_active = False
+            voice_request_action = None
+            if voice_state["phase"] == "idle" and not voice_processing and not goodbye_running:
+                wake_listener.stop()
+                start_wake_listener()
         settings_window = None
         settings_sync = None
         settings_changes = []
+        wake_sensitivity_restart_at = None
         eye_manual = False
         move_tween = None
         eye_video = ASSETS / "somethinginmyeye.avi"
@@ -1082,6 +1173,30 @@ def main() -> None:
             clock.tick(60)
             qt_app.processEvents()
             now = time.monotonic()
+            try:
+                wake_transcript = wake_events.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if voice_state["phase"] == "idle" and not voice_processing:
+                    wake_listener.stop()
+                    suspend_media_for_voice()
+                    voice_state["automatic"] = True
+                    print(
+                        f"MarioAssistant wake word: detected {wake_transcript!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    begin_voice_beeps("arming")
+            if (
+                not booting
+                and preferences.get("speech_enable_wake_word", True)
+                and voice_state["phase"] == "idle"
+                and not voice_processing
+                and not voice_silence_mode
+                and not goodbye_running
+            ):
+                wake_listener.start()
             if (voice_state["phase"] in ("arming", "finishing")
                     and now >= voice_state["deadline"]):
                 if voice_state["step"] == 0:
@@ -1089,10 +1204,11 @@ def main() -> None:
                     voice_state["deadline"] = now + 0.25
                 elif voice_state["step"] == 1:
                     voice_state["step"] = 2
+                    voice_beep_channel.stop()
                     voice_beep_channel.play(voice_beep_sound)
                     voice_state["deadline"] = now + 0.25
                 elif voice_state["phase"] == "arming":
-                    if voice_chord_held():
+                    if voice_chord_held() or voice_state["automatic"]:
                         try:
                             voice_state["capture"] = MicrophoneCapture()
                             voice_state["phase"] = "listening"
@@ -1151,8 +1267,18 @@ def main() -> None:
                             args=(voice_state["samples"],),
                             daemon=True,
                         ).start()
+                    else:
+                        voice_silence_mode = False
+                        start_wake_listener()
                     voice_state["samples"] = None
                     voice_state["error"] = None
+            if (
+                voice_state["phase"] == "listening"
+                and voice_state["automatic"]
+                and voice_state["capture"] is not None
+                and voice_state["capture"].should_auto_stop(now)
+            ):
+                finish_voice_capture()
             try:
                 transcript, voice_error, voice_action = voice_results.get_nowait()
             except queue.Empty:
@@ -1175,7 +1301,7 @@ def main() -> None:
                             file=sys.stderr,
                             flush=True,
                         )
-                        menu_action[0] = "voice_apology"
+                        menu_action[0] = "voice_unrecognized"
                     else:
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
@@ -1184,7 +1310,7 @@ def main() -> None:
                         elif voice_action is not None:
                             menu_action[0] = voice_action
                         else:
-                            menu_action[0] = voice_action or "voice_apology"
+                            menu_action[0] = voice_action or "voice_unrecognized"
                 else:
                     if voice_error is not None:
                         print(
@@ -1193,14 +1319,21 @@ def main() -> None:
                             file=sys.stderr,
                             flush=True,
                         )
-                        menu_action[0] = "voice_apology"
+                        menu_action[0] = "voice_unrecognized"
                     else:
                         if voice_action in ("tunnel", "eye"):
                             minigame_action[0] = voice_action
                         elif voice_action == "random_minigame":
                             queue_random_minigame()
                         else:
-                            menu_action[0] = voice_action or "voice_apology"
+                            menu_action[0] = voice_action or "voice_unrecognized"
+                voice_request_pending = True
+                voice_request_active = False
+                voice_request_action = (
+                    minigame_action[0]
+                    if voice_action == "random_minigame"
+                    else voice_action or "voice_unrecognized"
+                )
             if voice_processing and not voice_animation_done and now >= voice_animation_deadline:
                 audio.stop()
                 if not finished:
@@ -1210,7 +1343,8 @@ def main() -> None:
                     last_frame_surface = frame_surface
                 voice_animation_done = True
             if pet.tick():
-                disappointment_sound.play()
+                if not voice_silence_mode:
+                    disappointment_sound.play()
                 for need_name in tuple(pet_notifications):
                     try:
                         close_notification(Gio, GLib, pet_notifications.pop(need_name))
@@ -1235,6 +1369,13 @@ def main() -> None:
                     zen_mode = value
                 elif name == "super_zen_mode":
                     super_zen_mode = value
+                elif name == "speech_enable_wake_word":
+                    if value and not voice_silence_mode and voice_state["phase"] == "idle":
+                        start_wake_listener()
+                    else:
+                        wake_listener.stop()
+                elif name == "wake_word_sensitivity":
+                    wake_sensitivity_restart_at = time.monotonic() + 0.3
                 elif name == "chattiness":
                     next_idle_at = time.monotonic() + idle_delay(value)
                     if value == 0 and idle_playing:
@@ -1285,6 +1426,18 @@ def main() -> None:
                     if debug_update is not None:
                         debug_update(name)
             settings_changes.clear()
+            if (wake_sensitivity_restart_at is not None
+                    and now >= wake_sensitivity_restart_at):
+                if (preferences.get("speech_enable_wake_word", True)
+                        and preferences.get("wake_word_sensitivity", 5) > 0
+                        and not voice_silence_mode
+                        and voice_state["phase"] == "idle"
+                        and not goodbye_running):
+                    wake_listener.stop()
+                    start_wake_listener()
+                elif preferences.get("wake_word_sensitivity", 5) <= 0:
+                    wake_listener.stop()
+                wake_sensitivity_restart_at = None
             collect_eye = False
             skip_requested = False
             for event in pygame.event.get():
@@ -1304,6 +1457,9 @@ def main() -> None:
                             or event.key == pygame.K_l):
                         voice_keys_down.add(event.key)
                         if voice_state["phase"] == "idle" and voice_chord_held():
+                            wake_listener.stop()
+                            suspend_media_for_voice()
+                            voice_state["automatic"] = False
                             voice_state["samples"] = None
                             voice_state["error"] = None
                             begin_voice_beeps("arming")
@@ -1389,7 +1545,8 @@ def main() -> None:
                     )
                     continue
                 if fed is None:
-                    disappointment_sound.play()
+                    if not voice_silence_mode:
+                        disappointment_sound.play()
                     continue
                 if not pet.needy[fed] and fed in pet_notifications:
                     try:
@@ -1423,7 +1580,7 @@ def main() -> None:
                 if debug_update is not None:
                     debug_update("mariocoins")
 
-            if feeding_queue and not feeding_active:
+            if feeding_queue and not feeding_active and not voice_silence_mode:
                 feeding_queue.pop(0)
                 audio.stop()
                 if idle_playing:
@@ -1471,12 +1628,39 @@ def main() -> None:
                             print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                     pet_notification_close_at.pop(need_name, None)
 
+            if (voice_unrecognized_notification_id is not None
+                    and voice_unrecognized_notification_close_at is not None
+                    and now >= voice_unrecognized_notification_close_at):
+                try:
+                    close_notification(
+                        Gio, GLib, voice_unrecognized_notification_id
+                    )
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                voice_unrecognized_notification_id = None
+                voice_unrecognized_notification_close_at = None
+
+            if (random_minigame_notification_id is not None
+                    and random_minigame_notification_close_at is not None
+                    and now >= random_minigame_notification_close_at):
+                try:
+                    close_notification(
+                        Gio, GLib, random_minigame_notification_id
+                    )
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                random_minigame_notification_id = None
+                random_minigame_notification_close_at = None
+
             while Gtk is not None and Gtk.events_pending():
                 Gtk.main_iteration_do(False)
 
             if skip_requested or menu_action[0] == "stop":
+                stopped_from_menu = menu_action[0] == "stop"
                 if menu_action[0] == "stop":
                     menu_action[0] = None
+                if stopped_from_menu and voice_request_pending:
+                    finish_voice_request()
                 if feeding_active or feeding_queue:
                     eating_channel.stop()
                     feeding_active = False
@@ -1487,7 +1671,7 @@ def main() -> None:
                 finished = True
                 random_events_ready_at = time.monotonic() + 10
                 stop.set()
-                if process.poll() is None:
+                if process is not None and process.poll() is None:
                     process.terminate()
                 audio.stop()
                 frame_surface = last_frame_surface
@@ -1546,14 +1730,41 @@ def main() -> None:
 
             selected_action = menu_action[0]
             menu_action[0] = None
+            if voice_silence_mode and not voice_request_pending and selected_action != "goodbye":
+                selected_action = None
+            if voice_request_pending and selected_action is not None:
+                voice_request_pending = False
+                voice_request_active = True
             if feeding_active and (
-                selected_action in ("speak", "voice_apology", "goodbye")
+                selected_action in ("speak", "voice_apology", "ohsorry", "voice_unrecognized", "goodbye")
                 or minigame_action[0] is not None
             ):
                 eating_channel.stop()
                 feeding_active = False
                 feeding_queue.clear()
-            if selected_action == "voice_apology":
+            if selected_action == "voice_unrecognized":
+                play_error_sound(QtWidgets)
+                if voice_unrecognized_notification_id is not None:
+                    try:
+                        close_notification(
+                            Gio, GLib, voice_unrecognized_notification_id
+                        )
+                    except Exception as exc:
+                        print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                try:
+                    voice_unrecognized_notification_id = send_notification(
+                        Gio,
+                        GLib,
+                        title="Hey!",
+                        body="I didn't understand what you just said. Wanna try again?",
+                        expire_timeout=5000,
+                    )
+                    voice_unrecognized_notification_close_at = time.monotonic() + 5
+                except Exception as exc:
+                    print(f"MarioAssistant notification: {exc}", file=sys.stderr)
+                    voice_unrecognized_notification_id = None
+                    voice_unrecognized_notification_close_at = None
+            elif selected_action in ("voice_apology", "ohsorry"):
                 audio.stop()
                 if pet_video is not None:
                     finish_pet_alert()
@@ -1635,6 +1846,7 @@ def main() -> None:
                     )
             elif selected_action == "goodbye" and not goodbye_running:
                 goodbye_running = True
+                wake_listener.stop()
                 audio.stop()
                 try:
                     close_notification(Gio, GLib, eye_notification)
@@ -1720,16 +1932,29 @@ def main() -> None:
                 debug_window.raise_()
                 debug_window.activateWindow()
 
+            if voice_request_active and voice_request_action not in (
+                "speak", "voice_apology", "ohsorry", "move", "eye", "tunnel", "goodbye"
+            ):
+                finish_voice_request()
+
+            if voice_request_pending and minigame_action[0] is not None:
+                voice_request_pending = False
+                voice_request_active = True
+                voice_request_action = minigame_action[0]
+            elif voice_silence_mode and minigame_action[0] is not None:
+                minigame_action[0] = None
+
             if minigame_action[0] == "tunnel":
                 minigame_action[0] = None
                 if random_minigame_notification[0] is not None:
                     try:
-                        send_notification(
+                        random_minigame_notification_id = send_notification(
                             Gio,
                             GLib,
                             title="Hey!",
                             body=f"I'ma pick {random_minigame_notification[0]} just for you!",
                         )
+                        random_minigame_notification_close_at = time.monotonic() + 10
                     except Exception as exc:
                         print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                     random_minigame_notification[0] = None
@@ -1771,6 +1996,7 @@ def main() -> None:
                     )
                 if outcome == "close":
                     goodbye_running = True
+                    wake_listener.stop()
                     audio.stop()
                     for need_name in tuple(pet_notifications):
                         try:
@@ -1806,9 +2032,11 @@ def main() -> None:
                 frame_surface = greeting_first_surface
                 frame_dirty = True
                 random_events_ready_at = time.monotonic() + 10
+                if voice_request_active and voice_request_action == "tunnel":
+                    finish_voice_request()
 
             due_need = pet.due()
-            if (due_need is not None and pet_video is not None
+            if (not voice_silence_mode and due_need is not None and pet_video is not None
                     and due_need != pet_alert_need):
                 audio.stop()
                 pet_video = ASSETS / ("heyimhungry.avi" if due_need == "hunger" else "heyimthirsty.avi")
@@ -1837,7 +2065,7 @@ def main() -> None:
                 frame_dirty = False
                 is_greeting = False
                 greeting_tween_started = True
-            elif (due_need is not None and finished and not feeding_active and eye_event is None
+            elif (not voice_silence_mode and due_need is not None and finished and not feeding_active and eye_event is None
                     and move_tween is None and post_greeting_tween is None
                     and minigame_action[0] is None):
                 audio.stop()
@@ -1904,7 +2132,11 @@ def main() -> None:
             earliest_event = min(
                 ((next_eye_at, "eye"), (next_idle_at, "idle"), (next_wander_at, "wander"))
             )[1]
-            automatic_start = preferences["playfulness"] > 0 and time.monotonic() >= next_eye_at
+            automatic_start = (
+                not voice_silence_mode
+                and preferences["playfulness"] > 0
+                and time.monotonic() >= next_eye_at
+            )
             if (super_zen_mode and automatic_start
                     and (eye_event is None or eye_manual)):
                 try:
@@ -1930,12 +2162,13 @@ def main() -> None:
             )):
                 if random_minigame_notification[0] is not None:
                     try:
-                        send_notification(
+                        random_minigame_notification_id = send_notification(
                             Gio,
                             GLib,
                             title="Hey!",
                             body=f"I'ma pick {random_minigame_notification[0]} just for you!",
                         )
+                        random_minigame_notification_close_at = time.monotonic() + 10
                     except Exception as exc:
                         print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                     random_minigame_notification[0] = None
@@ -1969,7 +2202,11 @@ def main() -> None:
                     except Exception as exc:
                         print(f"MarioAssistant notification: {exc}", file=sys.stderr)
 
-            idle_due = preferences["chattiness"] > 0 and time.monotonic() >= next_idle_at
+            idle_due = (
+                not voice_silence_mode
+                and preferences["chattiness"] > 0
+                and time.monotonic() >= next_idle_at
+            )
             if idle_due and super_zen_mode and not idle_playing:
                 next_idle_at = time.monotonic() + idle_delay(preferences["chattiness"])
                 idle_due = False
@@ -2036,6 +2273,25 @@ def main() -> None:
                     consumed += 1
                     frame_dirty = True
 
+            if (
+                voice_request_active
+                and (
+                    voice_request_action in ("speak", "voice_apology", "ohsorry")
+                    or voice_request_action == "move"
+                    and video == ASSETS / "ohsorry.mp4"
+                )
+                and finished
+                and audio.get_num_channels() == 0
+            ):
+                finish_voice_request()
+            if (
+                voice_request_active
+                and voice_request_action == "eye"
+                and eye_event is None
+                and finished
+            ):
+                finish_voice_request()
+
             if finished and first_run and not save_written:
                 write_save_data(save_path, pet.snapshot())
                 save_written = True
@@ -2082,6 +2338,7 @@ def main() -> None:
                         tray_update = create_tray_menu(
                             QtWidgets, NOTIFICATIONS.tray, menu_action, live_values
                         )
+                        start_wake_listener()
 
             if move_tween is not None:
                 progress = min(
@@ -2129,8 +2386,10 @@ def main() -> None:
                         started = time.monotonic()
                         finished = False
                         frame_dirty = False
+                    elif voice_request_active and voice_request_action == "move":
+                        finish_voice_request()
 
-            if (time.monotonic() >= next_wander_at and earliest_event == "wander" and preferences["wandering"] > 0
+            if (not voice_silence_mode and time.monotonic() >= next_wander_at and earliest_event == "wander" and preferences["wandering"] > 0
                     and not super_zen_mode and finished and not feeding_active and eye_event is None and post_greeting_tween is None
                     and move_tween is None and time.monotonic() >= random_events_ready_at):
                 screens = qt_app.screens()
@@ -2151,7 +2410,7 @@ def main() -> None:
                 window_move_changed_at = None
 
             current_position = tuple(window.position)
-            if (not feeding_active and greeting_tween_started and post_greeting_tween is None
+            if (not voice_silence_mode and not feeding_active and greeting_tween_started and post_greeting_tween is None
                     and move_tween is None):
                 if current_position != last_window_position:
                     window_move_changed_at = time.monotonic()
@@ -2234,6 +2493,8 @@ def main() -> None:
             video_texture.draw(dstrect=(0, 0, width, height))
             renderer.present()
     finally:
+        if "wake_listener" in locals():
+            wake_listener.stop()
         pet.tick()
         if not first_run or (save_path.exists() or "save_written" in locals() and save_written):
             try:

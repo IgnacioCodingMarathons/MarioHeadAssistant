@@ -1,12 +1,17 @@
 import json
+import math
 import mmap
 import os
+import queue
 import re
 import shutil
 import sys
 import subprocess
+import struct
 import threading
+import tempfile
 import time
+from collections import deque
 from pathlib import Path
 import urllib.request
 
@@ -15,6 +20,11 @@ from pygame._sdl2 import AUDIO_S16, AudioDevice, get_audio_device_names
 
 SAMPLE_RATE = 16000
 MAX_RECORDING_BYTES = SAMPLE_RATE * 2 * 30
+WAKE_PHRASES = (
+    "hey mario head", "hey mario had", "hey mario hat",
+    "hey marie head", "hey marie had", "hey marie hat",
+    "hey mariobritish head", "hey mariobritish had", "hey mariobritish hat",
+)
 try:
     VOSK_THREADS = max(1, min(8, int(os.environ.get(
         "MARIOASSISTANT_VOSK_THREADS",
@@ -50,6 +60,9 @@ class MicrophoneCapture:
         self.samples = bytearray()
         self.lock = threading.Lock()
         self.accepting = True
+        self.started_at = time.monotonic()
+        self.last_voice_at = self.started_at
+        self.speech_started = False
         self.device = AudioDevice(
             devicename=devices[0],
             iscapture=True,
@@ -66,10 +79,29 @@ class MicrophoneCapture:
         if not self.accepting:
             return
         chunk = bytes(audio)
+        sample_count = len(chunk) // 2
+        if sample_count:
+            square_sum = sum(
+                sample[0] * sample[0]
+                for sample in struct.iter_unpack("<h", chunk[:sample_count * 2])
+            )
+            if math.sqrt(square_sum / sample_count) >= 450:
+                with self.lock:
+                    self.speech_started = True
+                    self.last_voice_at = time.monotonic()
         with self.lock:
             remaining = MAX_RECORDING_BYTES - len(self.samples)
             if remaining > 0:
                 self.samples.extend(chunk[:remaining])
+
+    def should_auto_stop(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if len(self.samples) >= MAX_RECORDING_BYTES:
+                return True
+            if self.speech_started:
+                return now - self.last_voice_at >= 1.25
+            return now - self.started_at >= 10
 
     def stop(self):
         self.accepting = False
@@ -93,7 +125,6 @@ class SpeechTranscriber:
             "vosk_quick": threading.Lock(),
             "vosk_smart": threading.Lock(),
         }
-        self.failed_models = set()
         self.last_engine = None
         self.google_checked_at = 0.0
         self.google_is_online = False
@@ -217,8 +248,6 @@ class SpeechTranscriber:
     def _transcribe_vosk(self, method, samples):
         import vosk
 
-        if method in self.failed_models:
-            raise RuntimeError("This Vosk model failed earlier in this session")
         if self.gpu_enabled:
             try:
                 vosk.GpuThreadInit()
@@ -229,12 +258,7 @@ class SpeechTranscriber:
                     file=sys.stderr,
                     flush=True,
                 )
-        with self.model_locks[method]:
-            model = self.models.get(method)
-            if model is None:
-                vosk.SetLogLevel(-1)
-                model = vosk.Model(str(self.model_paths[method]))
-                self.models[method] = model
+        model = self._load_vosk_model(method, vosk)
         recognizer = vosk.KaldiRecognizer(model, SAMPLE_RATE)
         chunk_size = SAMPLE_RATE * 2
         for offset in range(0, len(samples), chunk_size):
@@ -243,6 +267,45 @@ class SpeechTranscriber:
         if not transcript:
             raise ValueError("Vosk did not recognize speech")
         return transcript
+
+    def _load_vosk_model(self, method, vosk=None):
+        if vosk is None:
+            import vosk
+        with self.model_locks[method]:
+            model = self.models.get(method)
+            if model is None:
+                vosk.SetLogLevel(-1)
+                model = vosk.Model(str(self.model_paths[method]))
+                self.models[method] = model
+        return model
+
+    def _reinitialize_vosk_model(self, method, reason):
+        with self.model_locks[method]:
+            had_cached_model = self.models.pop(method, None) is not None
+        if self.gpu_enabled:
+            self.gpu_enabled = False
+            print(
+                "MarioAssistant voice: Vosk model error under CUDA; retrying with CPU recognition",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not had_cached_model:
+            return
+        try:
+            model = self._load_vosk_model(method)
+            print(
+                f"MarioAssistant voice: reinitialized {method} after {type(reason).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return model
+        except Exception as exc:
+            print(
+                f"MarioAssistant voice: {method} reinitialization failed: {type(exc).__name__}: {exc}; future requests will retry",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
 
     def transcribe_google(self, samples):
         import speech_recognition as sr
@@ -287,8 +350,8 @@ class SpeechTranscriber:
                     else self._transcribe_vosk(method, samples)
                 )
             except Exception as exc:
-                if method != "google":
-                    self.failed_models.add(method)
+                if method != "google" and str(exc) != "Vosk did not recognize speech":
+                    self._reinitialize_vosk_model(method, exc)
                 errors.append(f"{method}: {type(exc).__name__}: {exc}")
                 print(
                     f"MarioAssistant voice: {method} failed: "
@@ -330,6 +393,255 @@ class SpeechTranscriber:
         )
 
 
+class WakeWordListener:
+    def __init__(self, transcriber, events):
+        self.transcriber = transcriber
+        self.events = events
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.device = None
+        self.chunks = queue.Queue(maxsize=64)
+        self.failed = False
+        self.reported_unavailable = False
+        self.failure_count = 0
+        self.retry_at = 0.0
+
+    def start(self):
+        if (self.thread is not None and self.thread.is_alive()) or time.monotonic() < self.retry_at:
+            return False
+        if (not self.transcriber.preferences.get("speech_enable_wake_word", True)
+                or self.transcriber.preferences.get("wake_word_sensitivity", 5) <= 0):
+            return False
+        while True:
+            try:
+                self.chunks.get_nowait()
+            except queue.Empty:
+                break
+        self.stop_event.clear()
+        self.failed = False
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _capture(self, device, audio):
+        try:
+            self.chunks.put_nowait(bytes(audio))
+        except queue.Full:
+            try:
+                self.chunks.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.chunks.put_nowait(bytes(audio))
+            except queue.Full:
+                pass
+
+    def _matches_wake_word(self, text):
+        normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        return any(phrase in normalized for phrase in WAKE_PHRASES)
+
+    def _rms(self, chunk):
+        sample_count = len(chunk) // 2
+        if sample_count == 0:
+            return 0.0
+        square_sum = sum(
+            sample[0] * sample[0]
+            for sample in struct.iter_unpack("<h", chunk[:sample_count * 2])
+        )
+        return math.sqrt(square_sum / sample_count)
+
+    def _recognize_wake_segment(self, decoder, chunks):
+        raw_audio = b"".join(chunks)
+        if len(raw_audio) < SAMPLE_RATE // 2:
+            return None
+        decoder.start_utt()
+        decoder.process_raw(raw_audio, False, True)
+        decoder.end_utt()
+        hypothesis = decoder.hyp()
+        if hypothesis is None:
+            return None
+        transcript = hypothesis.hypstr
+        return transcript if self._matches_wake_word(transcript) else None
+
+    def _create_decoder(self, pocketsphinx, acoustic_dir, dictionary_path, language_model_path, keywords_path):
+        config = pocketsphinx.Config()
+        config.set_string("-hmm", str(acoustic_dir))
+        config.set_string("-dict", str(dictionary_path))
+        config.set_string("-lm", str(language_model_path))
+        config.set_string("-logfn", os.devnull)
+        decoder = pocketsphinx.Decoder(config)
+        try:
+            decoder.add_word("mariobritish", "M AE R IY OW")
+        except Exception:
+            pass
+        decoder.add_kws("mario_wake", keywords_path)
+        decoder.activate_search("mario_wake")
+        return decoder
+
+    def _listen(self):
+        device = None
+        keywords_path = None
+        try:
+            import speech_recognition
+            from pocketsphinx import pocketsphinx
+
+            if self.stop_event.is_set():
+                return
+            model_dir = Path(speech_recognition.__file__).resolve().parent / "pocketsphinx-data" / "en-US"
+            acoustic_dir = model_dir / "acoustic-model"
+            dictionary_path = model_dir / "pronounciation-dictionary.dict"
+            language_model_path = model_dir / "language-model.lm.bin"
+            if (not acoustic_dir.is_dir() or not dictionary_path.is_file()
+                    or not language_model_path.is_file()):
+                raise RuntimeError(f"PocketSphinx English model files are missing from {model_dir}")
+            sensitivity = max(
+                1,
+                min(10, int(self.transcriber.preferences.get("wake_word_sensitivity", 5))),
+            )
+            main_threshold = 10 + sensitivity * 5
+            alternate_threshold = main_threshold - 5
+            rare_variant_threshold = alternate_threshold - 3
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as keyword_file:
+                keyword_file.write(f"hey mario head /1e-{main_threshold}/\n")
+                keyword_file.write(f"hey mario had /1e-{alternate_threshold}/\n")
+                keyword_file.write(f"hey mario hat /1e-{alternate_threshold}/\n")
+                keyword_file.write(f"hey marie head /1e-{alternate_threshold}/\n")
+                keyword_file.write(f"hey marie had /1e-{rare_variant_threshold}/\n")
+                keyword_file.write(f"hey marie hat /1e-{rare_variant_threshold}/\n")
+                keyword_file.write(f"hey mariobritish head /1e-{alternate_threshold}/\n")
+                keyword_file.write(f"hey mariobritish had /1e-{rare_variant_threshold}/\n")
+                keyword_file.write(f"hey mariobritish hat /1e-{rare_variant_threshold}/\n")
+                keywords_path = keyword_file.name
+            decoder = self._create_decoder(
+                pocketsphinx, acoustic_dir, dictionary_path,
+                language_model_path, keywords_path,
+            )
+            devices = get_audio_device_names(iscapture=True)
+            if not devices:
+                raise RuntimeError("No microphone input device is available")
+            if self.stop_event.is_set():
+                return
+            device = AudioDevice(
+                devicename=devices[0],
+                iscapture=True,
+                frequency=SAMPLE_RATE,
+                audioformat=AUDIO_S16,
+                numchannels=1,
+                chunksize=3200,
+                allowed_changes=0,
+                callback=self._capture,
+            )
+            self.device = device
+            device.pause(0)
+            self.failure_count = 0
+            pre_roll = deque(maxlen=3)
+            pre_roll_levels = deque(maxlen=3)
+            in_speech = False
+            quiet_chunks = 0
+            speech_chunks = []
+            voiced_chunks = 0
+            speech_threshold = 350.0
+            noise_floor = 180.0
+            cooldown_until = 0.0
+            while not self.stop_event.is_set():
+                try:
+                    chunk = self.chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if time.monotonic() < cooldown_until:
+                    continue
+                rms = self._rms(chunk)
+                if not in_speech:
+                    speech_threshold = max(350.0, noise_floor * 2.2)
+                    pre_roll.append(chunk)
+                    pre_roll_levels.append(rms)
+                    if rms < speech_threshold:
+                        noise_floor = noise_floor * 0.95 + rms * 0.05
+                        continue
+                    in_speech = True
+                    quiet_chunks = 0
+                    speech_chunks = list(pre_roll)
+                    voiced_chunks = sum(
+                        level >= speech_threshold for level in pre_roll_levels
+                    )
+                else:
+                    speech_chunks.append(chunk)
+                    if rms >= speech_threshold:
+                        voiced_chunks += 1
+                if rms < speech_threshold:
+                    quiet_chunks += 1
+                else:
+                    quiet_chunks = 0
+                if in_speech and (quiet_chunks >= 4 or len(speech_chunks) >= 15):
+                    transcript = None
+                    if voiced_chunks >= 3:
+                        try:
+                            transcript = self._recognize_wake_segment(
+                                decoder, speech_chunks
+                            )
+                        except Exception as exc:
+                            print(
+                                f"MarioAssistant wake word: decoder failed on an audio segment; reinitializing: {type(exc).__name__}: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            decoder = self._create_decoder(
+                                pocketsphinx, acoustic_dir, dictionary_path,
+                                language_model_path, keywords_path,
+                            )
+                    if transcript:
+                        self.events.put(transcript)
+                        return
+                    pre_roll.clear()
+                    pre_roll_levels.clear()
+                    in_speech = False
+                    quiet_chunks = 0
+                    speech_chunks = []
+                    voiced_chunks = 0
+                    cooldown_until = time.monotonic() + 0.75
+        except Exception as exc:
+            self.failed = True
+            self.failure_count += 1
+            self.retry_at = time.monotonic() + min(
+                2 ** min(self.failure_count, 5), 60
+            )
+            if (isinstance(exc, ImportError) or "model files are missing" in str(exc)) and not self.reported_unavailable:
+                print(
+                    "MarioAssistant wake word: offline PocketSphinx is unavailable; install the pocketsphinx dependency",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.reported_unavailable = True
+                return
+            print(
+                f"MarioAssistant wake word: listener failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            self.device = None
+            if keywords_path is not None:
+                try:
+                    os.unlink(keywords_path)
+                except OSError:
+                    pass
+            if device is not None:
+                try:
+                    device.pause(1)
+                    device.close()
+                except Exception as exc:
+                    print(
+                        f"MarioAssistant wake word: microphone close failed: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+
 def interpret_voice_command(transcript):
     text = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
     words = set(text.split())
@@ -343,11 +655,22 @@ def interpret_voice_command(transcript):
         return "stop"
     if contains("goodbye"):
         return "goodbye"
+    if any(contains(phrase) for phrase in (
+        "i didn't say your name",
+        "i did not say your name",
+        "i didnt say your name",
+        "i didn t say your name",
+        "i didn't call you",
+        "i did not call you",
+        "i didnt call you",
+        "i didn t call you",
+    )):
+        return "ohsorry"
     if "speak" in words or contains("say something"):
         return "speak"
     if "voice" in words and ("command" in words or "commands" in words):
         return "commands"
-    if "quench" in words:
+    if words.intersection({"quench", "clinch"}):
         if "hunger" in words and "thirst" not in words:
             return "quench_hunger"
         if "thirst" in words and "hunger" not in words:

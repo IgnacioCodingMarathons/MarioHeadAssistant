@@ -28,6 +28,30 @@ def play_information_sound(QtWidgets):
         QtWidgets.QApplication.beep()
 
 
+def play_error_sound(QtWidgets):
+    if sys.platform == 'win32':
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONHAND)
+        return
+    if sys.platform == 'darwin':
+        player = shutil.which('afplay')
+        sound = Path('/System/Library/Sounds/Basso.aiff')
+    else:
+        player = shutil.which('paplay') or shutil.which('pw-play') or shutil.which('ffplay')
+        sound = next((p for p in (
+            Path('/usr/share/sounds/freedesktop/stereo/dialog-error.oga'),
+            Path('/usr/share/sounds/gnome/default/alerts/bark.ogg'),
+            Path('/usr/share/sounds/freedesktop/stereo/dialog-warning.oga'),
+        ) if p.exists()), None)
+    if player and sound and sound.exists():
+        command = [player, str(sound)]
+        if Path(player).stem == 'ffplay':
+            command = [player, '-nodisp', '-autoexit', '-loglevel', 'quiet', str(sound)]
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        QtWidgets.QApplication.beep()
+
+
 class DesktopNotifications:
     def __init__(self, QtWidgets):
         self.tray = QtWidgets.QSystemTrayIcon(
@@ -37,9 +61,9 @@ class DesktopNotifications:
         self.tray.show()
         self.QtWidgets = QtWidgets
 
-    def show(self, title='Hey!', body='I got something in my eye, can you help me get it out?'):
+    def show(self, title='Hey!', body='I got something in my eye, can you help me get it out?', duration_ms=60000):
         self.tray.showMessage(title, body,
-                              self.QtWidgets.QSystemTrayIcon.MessageIcon.Information, 60000)
+                              self.QtWidgets.QSystemTrayIcon.MessageIcon.Information, duration_ms)
         return self
 
     def close(self):
