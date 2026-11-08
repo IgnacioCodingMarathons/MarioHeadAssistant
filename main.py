@@ -54,6 +54,7 @@ FRAME_BYTES = VIDEO_SIZE[0] * VIDEO_SIZE[1] * 3
 TWEEN_SECONDS = 0.75
 COIN_POPUPS = []
 NOTIFICATIONS = None
+MARIO_VOLUME = 1.0
 
 
 def app_data_dir() -> Path:
@@ -173,6 +174,7 @@ def start_media(ffmpeg, temp_dir, video_texture, process, stop, reader, video):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
     )
     audio = pygame.mixer.Sound(str(audio_path))
+    audio.set_volume(MARIO_VOLUME)
     frame = decode_first_frame(ffmpeg, video)
     last_frame = decode_last_frame(ffmpeg, video)
     video_texture.update(frame)
@@ -262,6 +264,7 @@ def create_voice_commands_window(QtCore, QtWidgets):
         "Settings: ‘settings’ or ‘configure’.\n"
         "Speak: ‘speak’ or ‘say something’.\n"
         "Oh, sorry!: ‘I didn’t say your name’ or ‘I didn’t call you’.\n"
+        "Volume: ‘set volume to’, ‘lower volume by’, or ‘increase volume by’ with a number from 0 to 100; optionally add ‘percent’.\n"
         "Quench hunger or thirst: ‘quench’ or ‘clinch’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
         "Show this list: ‘voice command’ or ‘voice commands’; optionally add ‘see’ and ‘Mario’s’, then ‘list’, ‘to say’, or ‘to use’."
     )
@@ -788,7 +791,7 @@ def main() -> None:
     qt_app.setQuitOnLastWindowClosed(False)
     qt_app.setApplicationName("MarioAssistant")
     window_policy = install_linux_window_policy(qt_app)
-    global NOTIFICATIONS
+    global NOTIFICATIONS, MARIO_VOLUME
     NOTIFICATIONS = DesktopNotifications(QtWidgets)
     goodbye_completed = False
     ffmpeg = shutil.which("ffmpeg")
@@ -992,6 +995,11 @@ def main() -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
         )
         eating_sound = pygame.mixer.Sound(str(eating_audio_path))
+        for sound in (
+            audio, disappointment_sound, kaching_sound, eating_sound,
+            voice_beep_sound,
+        ):
+            sound.set_volume(MARIO_VOLUME)
         pygame.mixer.set_reserved(1)
         eating_channel = pygame.mixer.Channel(0)
         eating_video = ASSETS / "goodjoke.avi"
@@ -1764,6 +1772,23 @@ def main() -> None:
                     print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                     voice_unrecognized_notification_id = None
                     voice_unrecognized_notification_close_at = None
+            elif selected_action is not None and selected_action.startswith("volume_"):
+                operation, amount_text = selected_action.removeprefix("volume_").split(":", 1)
+                amount = float(amount_text)
+                current_volume = MARIO_VOLUME * 100
+                if operation == "set":
+                    new_volume = amount
+                elif operation == "lower":
+                    new_volume = current_volume - amount
+                else:
+                    new_volume = current_volume + amount
+                MARIO_VOLUME = max(0.0, min(100.0, new_volume)) / 100
+                for sound in (
+                    audio, disappointment_sound, kaching_sound,
+                    eating_sound, voice_beep_sound,
+                ):
+                    sound.set_volume(MARIO_VOLUME)
+                play_information_sound(QtWidgets)
             elif selected_action in ("voice_apology", "ohsorry"):
                 audio.stop()
                 if pet_video is not None:

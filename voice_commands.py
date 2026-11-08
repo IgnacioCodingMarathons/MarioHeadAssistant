@@ -666,6 +666,16 @@ def interpret_voice_command(transcript):
         "i didn t call you",
     )):
         return "ohsorry"
+    volume_commands = (
+        ("set volume to ", "set"),
+        ("lower volume by ", "lower"),
+        ("increase volume by ", "increase"),
+    )
+    for prefix, operation in volume_commands:
+        if text.startswith(prefix):
+            amount = parse_voice_number(text[len(prefix):])
+            if amount is not None:
+                return f"volume_{operation}:{amount}"
     if "speak" in words or contains("say something"):
         return "speak"
     if "voice" in words and ("command" in words or "commands" in words):
@@ -708,4 +718,48 @@ def interpret_voice_command(transcript):
         return "petcare"
     if "settings" in words or "configure" in words:
         return "settings"
+    return None
+
+
+def parse_voice_number(text):
+    tokens = text.strip().split()
+    if tokens and tokens[-1] == "percent":
+        tokens.pop()
+    if not tokens:
+        return None
+    if len(tokens) == 1:
+        try:
+            number = float(tokens[0])
+        except ValueError:
+            number = None
+        if number is not None and 0 <= number <= 100:
+            return number
+    small_numbers = {
+        "zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3,
+        "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+        "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+        "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19,
+    }
+    tens = {
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    }
+    tokens = [token for token in tokens if token != "and"]
+    if tokens == ["hundred"] or tokens in (["a", "hundred"], ["one", "hundred"]):
+        return 100
+    if len(tokens) == 2 and tokens[0] in tens and tokens[1] in small_numbers:
+        number = tens[tokens[0]] + small_numbers[tokens[1]]
+        return number if number <= 100 else None
+    if len(tokens) == 1:
+        return small_numbers.get(tokens[0], tens.get(tokens[0]))
+    if len(tokens) in (2, 3) and tokens[0] in small_numbers and tokens[1] == "hundred":
+        remainder = 0
+        if len(tokens) == 3:
+            remainder = small_numbers.get(tokens[2], tens.get(tokens[2], -1))
+            if remainder < 0:
+                return None
+        number = small_numbers[tokens[0]] * 100 + remainder
+        return number if number <= 100 else None
     return None
