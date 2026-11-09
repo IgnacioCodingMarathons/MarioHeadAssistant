@@ -53,7 +53,15 @@ def create_beep_sound(pygame):
 
 
 class MicrophoneCapture:
-    def __init__(self):
+    def __init__(self, finish_sensitivity=5):
+        try:
+            self.finish_sensitivity = max(0, min(10, int(finish_sensitivity)))
+        except (TypeError, ValueError):
+            self.finish_sensitivity = 5
+        self.speech_threshold = (
+            450 if self.finish_sensitivity == 0
+            else 150 + (self.finish_sensitivity - 1) * 75
+        )
         devices = get_audio_device_names(iscapture=True)
         if not devices:
             raise RuntimeError("No microphone input device is available")
@@ -85,7 +93,7 @@ class MicrophoneCapture:
                 sample[0] * sample[0]
                 for sample in struct.iter_unpack("<h", chunk[:sample_count * 2])
             )
-            if math.sqrt(square_sum / sample_count) >= 450:
+            if math.sqrt(square_sum / sample_count) >= self.speech_threshold:
                 with self.lock:
                     self.speech_started = True
                     self.last_voice_at = time.monotonic()
@@ -99,6 +107,8 @@ class MicrophoneCapture:
         with self.lock:
             if len(self.samples) >= MAX_RECORDING_BYTES:
                 return True
+            if self.finish_sensitivity == 0:
+                return now - self.started_at >= 5
             if self.speech_started:
                 return now - self.last_voice_at >= 1.25
             return now - self.started_at >= 10
@@ -455,6 +465,31 @@ class WakeWordListener:
         )
         return math.sqrt(square_sum / sample_count)
 
+    def _is_voiced(self, chunk):
+        raw_samples = struct.iter_unpack("<h", chunk[:len(chunk) // 2 * 2])
+        samples = [sample[0] for index, sample in enumerate(raw_samples) if index % 4 == 0]
+        if len(samples) < 100:
+            return False
+        mean = sum(samples) / len(samples)
+        signal = [sample - mean for sample in samples]
+        energy = sum(sample * sample for sample in signal)
+        if energy < 1:
+            return False
+        best_correlation = 0.0
+        for lag in range(12, 51):
+            left_energy = sum(value * value for value in signal[:-lag])
+            right_energy = sum(value * value for value in signal[lag:])
+            if left_energy <= 0 or right_energy <= 0:
+                continue
+            cross = sum(
+                left * right
+                for left, right in zip(signal[:-lag], signal[lag:])
+            )
+            correlation = cross / math.sqrt(left_energy * right_energy)
+            if correlation > best_correlation:
+                best_correlation = correlation
+        return best_correlation >= 0.20
+
     def _recognize_wake_segment(self, decoder, chunks):
         raw_audio = b"".join(chunks)
         if len(raw_audio) < SAMPLE_RATE // 2:
@@ -503,9 +538,9 @@ class WakeWordListener:
                 1,
                 min(10, int(self.transcriber.preferences.get("wake_word_sensitivity", 5))),
             )
-            main_threshold = 10 + sensitivity * 5
-            alternate_threshold = main_threshold - 5
-            rare_variant_threshold = alternate_threshold - 3
+            main_threshold = 40 - sensitivity * 2
+            alternate_threshold = main_threshold + 5
+            rare_variant_threshold = main_threshold + 8
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as keyword_file:
                 keyword_file.write(f"hey mario head /1e-{main_threshold}/\n")
                 keyword_file.write(f"hey mario had /1e-{alternate_threshold}/\n")
@@ -541,12 +576,18 @@ class WakeWordListener:
             self.failure_count = 0
             pre_roll = deque(maxlen=3)
             pre_roll_levels = deque(maxlen=3)
+            calibration_levels = []
+            calibrated = False
             in_speech = False
             quiet_chunks = 0
             speech_chunks = []
             voiced_chunks = 0
             speech_threshold = 350.0
-            noise_floor = 180.0
+            noise_floor = 100.0
+            sensitivity = max(
+                1,
+                min(10, int(self.transcriber.preferences.get("wake_word_sensitivity", 5))),
+            )
             cooldown_until = 0.0
             while not self.stop_event.is_set():
                 try:
@@ -556,30 +597,40 @@ class WakeWordListener:
                 if time.monotonic() < cooldown_until:
                     continue
                 rms = self._rms(chunk)
+                if not calibrated:
+                    calibration_levels.append(rms)
+                    if len(calibration_levels) < 5:
+                        continue
+                    calibration_levels.sort()
+                    noise_floor = max(40.0, calibration_levels[len(calibration_levels) // 3])
+                    calibrated = True
+                    continue
                 if not in_speech:
-                    speech_threshold = max(350.0, noise_floor * 2.2)
+                    minimum_threshold = 350.0 - sensitivity * 20
+                    speech_threshold = max(minimum_threshold, noise_floor * 2.2)
                     pre_roll.append(chunk)
                     pre_roll_levels.append(rms)
                     if rms < speech_threshold:
-                        noise_floor = noise_floor * 0.95 + rms * 0.05
+                        noise_floor = max(40.0, noise_floor * 0.98 + rms * 0.02)
                         continue
                     in_speech = True
                     quiet_chunks = 0
                     speech_chunks = list(pre_roll)
                     voiced_chunks = sum(
-                        level >= speech_threshold for level in pre_roll_levels
+                        level >= speech_threshold and self._is_voiced(voiced_chunk)
+                        for level, voiced_chunk in zip(pre_roll_levels, pre_roll)
                     )
                 else:
                     speech_chunks.append(chunk)
-                    if rms >= speech_threshold:
+                    if rms >= speech_threshold and self._is_voiced(chunk):
                         voiced_chunks += 1
                 if rms < speech_threshold:
                     quiet_chunks += 1
                 else:
                     quiet_chunks = 0
-                if in_speech and (quiet_chunks >= 4 or len(speech_chunks) >= 15):
+                if in_speech and (quiet_chunks >= 6 or len(speech_chunks) >= 15):
                     transcript = None
-                    if voiced_chunks >= 3:
+                    if voiced_chunks >= 1:
                         try:
                             transcript = self._recognize_wake_segment(
                                 decoder, speech_chunks
@@ -656,6 +707,10 @@ def interpret_voice_command(transcript):
         return "stop"
     if contains("goodbye"):
         return "goodbye"
+    if re.fullmatch(r"(?:hello|hi|howdy|hey)(?: there)?", text):
+        return "hello"
+    if re.fullmatch(r"eject (?:a )?cd", text):
+        return "eject_cd"
     if (contains("what did you hear") or contains("what'd you hear")):
         return "what_heard"
     if (

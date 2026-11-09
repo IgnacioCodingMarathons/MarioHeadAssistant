@@ -121,6 +121,16 @@ class PetNeeds:
     def is_full(self, name):
         return name in self.levels and self.levels[name] >= 99.9
 
+    def fill(self, name):
+        if name not in self.levels:
+            return False
+        self.levels[name] = 100.0
+        self.needy[name] = False
+        self.reminders[name] = math.inf
+        if self.requested == name:
+            self.requested = None
+        return True
+
     def remind(self, name, now=None):
         now = time.monotonic() if now is None else now
         self.requested = name
@@ -132,7 +142,32 @@ class PetNeeds:
         path = Path(filename)
         if path.suffix.lower() in ROM_EXTENSIONS or not path.is_file():
             return None
-        size = path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        if size == 0:
+            return None
+        food_order = '.food' in {suffix.lower() for suffix in path.suffixes}
+        if food_order:
+            has_digits = False
+            try:
+                with path.open('rb') as order_file:
+                    while True:
+                        chunk = order_file.read(65536)
+                        if not chunk:
+                            break
+                        if any(
+                            not (48 <= byte <= 57 or byte in b' \t\r\n\v\f')
+                            for byte in chunk
+                        ):
+                            return None
+                        if any(48 <= byte <= 57 for byte in chunk):
+                            has_digits = True
+            except OSError:
+                return None
+            if not has_digits:
+                return None
         steam_shortcut = is_steam_shortcut(path)
         self.tick(now)
         if target not in self.levels:
@@ -141,8 +176,11 @@ class PetNeeds:
                 target = min(self.levels, key=self.levels.get)
         if self.is_full(target):
             return 'full'
-        boost = 10 if steam_shortcut else size / 1_000_000 * 5
-        self.levels[target] = min(100, self.levels[target] + boost)
+        if food_order:
+            self.levels[target] = 100
+        else:
+            boost = 10 if steam_shortcut else size / 1_000_000 * 5
+            self.levels[target] = min(100, self.levels[target] + boost)
         if self.levels[target] > 50:
             self.needy[target] = False
             self.reminders[target] = math.inf
@@ -167,6 +205,7 @@ def create_pet_care_window(QtWidgets, values):
         bars[name] = bar
     instruction = QtWidgets.QLabel(
         'Drop a file on Mario: left feeds hunger, right feeds thirst. Files stay untouched.\n'
+        'A .food file containing only digits fills the targeted meter.\n'
         '10 MB restores 50%; accepted files earn 50 MarioCoins.\n'
         'At Caring Difficulty 0, Mario will not accept files and both meters stay full.'
     )

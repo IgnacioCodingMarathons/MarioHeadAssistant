@@ -28,6 +28,113 @@ def play_information_sound(QtWidgets):
         QtWidgets.QApplication.beep()
 
 
+def play_task_complete_sound(QtWidgets):
+    if sys.platform == 'win32':
+        import winsound
+        winsound.MessageBeep(winsound.MB_OK)
+        return
+    if sys.platform == 'darwin':
+        player = shutil.which('afplay')
+        sound = Path('/System/Library/Sounds/Glass.aiff')
+    else:
+        player = shutil.which('paplay') or shutil.which('pw-play') or shutil.which('ffplay')
+        sound = next((p for p in (
+            Path('/usr/share/sounds/freedesktop/stereo/complete.oga'),
+            Path('/usr/share/sounds/freedesktop/stereo/dialog-information.oga'),
+            Path('/usr/share/sounds/freedesktop/stereo/message.oga'),
+        ) if p.exists()), None)
+    if player and sound and sound.exists():
+        command = [player, str(sound)]
+        if Path(player).stem == 'ffplay':
+            command = [player, '-nodisp', '-autoexit', '-loglevel', 'quiet', str(sound)]
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        QtWidgets.QApplication.beep()
+
+
+def eject_cd():
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        get_drive_type = kernel32.GetDriveTypeW
+        get_drive_type.argtypes = [wintypes.LPCWSTR]
+        get_drive_type.restype = wintypes.UINT
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        device_io = kernel32.DeviceIoControl
+        device_io.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        device_io.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        invalid_handle = wintypes.HANDLE(-1).value
+        for letter in 'DEFGHIJKLMNOPQRSTUVWXYZ':
+            root = f'{letter}:\\'
+            if get_drive_type(root) != 5:
+                continue
+            handle = create_file(
+                f'\\\\.\\{letter}:', 0x80000000, 3, None, 3, 0, None
+            )
+            if handle == invalid_handle:
+                continue
+            try:
+                returned = wintypes.DWORD()
+                if device_io(handle, 0x002D4800, None, 0, None, 0,
+                             ctypes.byref(returned), None):
+                    return bool(device_io(
+                        handle, 0x002D4808, None, 0, None, 0,
+                        ctypes.byref(returned), None,
+                    ))
+            finally:
+                close_handle(handle)
+        return False
+    if sys.platform == 'darwin':
+        drutil = shutil.which('drutil')
+        if not drutil:
+            return False
+        try:
+            status = subprocess.run(
+                [drutil, 'status'], capture_output=True, text=True,
+                check=True, timeout=5,
+            ).stdout.lower()
+            if 'no media' in status or 'media type:' not in status:
+                return False
+            subprocess.run(
+                [drutil, 'eject'], check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=5,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+    eject = shutil.which('eject')
+    if not eject:
+        return False
+    drives = sorted(Path('/sys/class/block').glob('sr*'))
+    for drive in drives:
+        try:
+            if int((drive / 'size').read_text().strip()) <= 0:
+                continue
+            subprocess.run(
+                [eject, f'/dev/{drive.name}'], check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            return True
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return False
+
+
 def play_error_sound(QtWidgets):
     if sys.platform == 'win32':
         import winsound

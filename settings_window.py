@@ -13,6 +13,7 @@ DEFAULT_SETTINGS = {
     'super_zen_mode': False,
     'oh_sorry': True,
     'caring_difficulty': 5,
+    'autofeed': False,
     'speech_use_one_method_only': False,
     'speech_method_order': ['vosk_quick', 'google', 'vosk_smart'],
     'speech_preferred_method': 'google',
@@ -21,6 +22,7 @@ DEFAULT_SETTINGS = {
     'speech_enable_google': True,
     'speech_enable_wake_word': True,
     'wake_word_sensitivity': 5,
+    'finish_sensitivity': 5,
 }
 
 
@@ -61,7 +63,7 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
           ('"Oh, sorry!"', 'oh_sorry')]),
         ('Movement', [('Wandering', 'wandering')],
          [('Use entropy for position', 'use_entropy_for_position')]),
-        ('Pet Care', [('Caring Difficulty', 'caring_difficulty')], []),
+        ('Pet Care', [('Caring Difficulty', 'caring_difficulty')], [('Autofeed', 'autofeed')]),
     ):
         page = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(page)
@@ -116,6 +118,17 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
     wake_sensitivity_layout.addWidget(wake_sensitivity)
     wake_sensitivity_layout.addWidget(wake_sensitivity_value)
     speech_layout.addWidget(wake_sensitivity_row)
+    speech_layout.addWidget(QtWidgets.QLabel('Finish Sensitivity'))
+    finish_sensitivity_row = QtWidgets.QWidget()
+    finish_sensitivity_layout = QtWidgets.QHBoxLayout(finish_sensitivity_row)
+    finish_sensitivity = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+    finish_sensitivity.setObjectName('finish_sensitivity')
+    finish_sensitivity.setRange(0, 10)
+    finish_sensitivity.setValue(int(values.get('finish_sensitivity', 5)))
+    finish_sensitivity_value = QtWidgets.QLabel(str(finish_sensitivity.value()))
+    finish_sensitivity_layout.addWidget(finish_sensitivity)
+    finish_sensitivity_layout.addWidget(finish_sensitivity_value)
+    speech_layout.addWidget(finish_sensitivity_row)
     use_one_method = QtWidgets.QCheckBox('Use one method only')
     use_one_method.setChecked(values['speech_use_one_method_only'])
     speech_layout.addWidget(use_one_method)
@@ -170,6 +183,7 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
         'speech_enable_google': enable_google,
         'speech_enable_wake_word': enable_wake_word,
         'wake_word_sensitivity': wake_sensitivity,
+        'finish_sensitivity': finish_sensitivity,
     })
     google_online = [False]
 
@@ -272,6 +286,16 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
     wake_sensitivity.valueChanged.connect(update_wake_sensitivity)
     wake_sensitivity.sliderReleased.connect(
         lambda: changed('wake_word_sensitivity', wake_sensitivity.value())
+    )
+
+    def update_finish_sensitivity(value):
+        finish_sensitivity_value.setText(str(value))
+        if not finish_sensitivity.isSliderDown():
+            changed('finish_sensitivity', value)
+
+    finish_sensitivity.valueChanged.connect(update_finish_sensitivity)
+    finish_sensitivity.sliderReleased.connect(
+        lambda: changed('finish_sensitivity', finish_sensitivity.value())
     )
     preferred_method.currentIndexChanged.connect(
         lambda index: changed(

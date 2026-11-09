@@ -1,0 +1,6 @@
+@echo off
+echo installing ffmpeg...
+winget install Gyan.FFmpeg --version 6.1.1
+echo installing python dependencies...
+pip install -r requirements.txt
+echo all done!
