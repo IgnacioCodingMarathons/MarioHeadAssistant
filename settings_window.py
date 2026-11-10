@@ -23,6 +23,9 @@ DEFAULT_SETTINGS = {
     'speech_enable_wake_word': True,
     'wake_word_sensitivity': 5,
     'finish_sensitivity': 5,
+    'tts_live_sentence_mixing': False,
+    'weather_city': '',
+    'weather_country_code': '',
 }
 
 
@@ -174,6 +177,34 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
     online_status = QtWidgets.QLabel('Checking Google availability…')
     speech_layout.addWidget(online_status)
     add_scroll_tab(speech_page, 'Speech Recognition')
+
+    tts_page = QtWidgets.QWidget()
+    tts_layout = QtWidgets.QVBoxLayout(tts_page)
+    live_sentence_mixing = QtWidgets.QCheckBox(
+        'Enable Live Sentence Mixing (experimental)'
+    )
+    live_sentence_mixing.setChecked(
+        values.get('tts_live_sentence_mixing', False)
+    )
+    live_sentence_mixing.toggled.connect(
+        lambda value: changed('tts_live_sentence_mixing', value)
+    )
+    controls['tts_live_sentence_mixing'] = live_sentence_mixing
+    tts_layout.addWidget(live_sentence_mixing)
+    add_scroll_tab(tts_page, 'TTS')
+
+    weather_page = QtWidgets.QWidget()
+    weather_form = QtWidgets.QFormLayout(weather_page)
+    location_help = QtWidgets.QLabel('Choose a city for accurate weather. Leave it blank to use your approximate network location.')
+    location_help.setWordWrap(True)
+    weather_form.addRow(location_help)
+    for label, name in (('City', 'weather_city'), ('Country code (for example, AR)', 'weather_country_code')):
+        field = QtWidgets.QLineEdit(str(values.get(name, '') or ''))
+        field.setObjectName(name)
+        field.editingFinished.connect(lambda field=field, name=name: changed(name, field.text().strip()))
+        controls[name] = field
+        weather_form.addRow(label, field)
+    add_scroll_tab(weather_page, 'Weather')
 
     controls.update({
         'speech_use_one_method_only': use_one_method,
@@ -345,6 +376,8 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
             control.setChecked(value)
         elif isinstance(control, QtWidgets.QComboBox):
             control.setCurrentIndex(control.findData(value, QtCore.Qt.ItemDataRole.UserRole))
+        elif isinstance(control, QtWidgets.QLineEdit):
+            control.setText(str(value or ''))
         else:
             control.setValue(value)
         del blocker

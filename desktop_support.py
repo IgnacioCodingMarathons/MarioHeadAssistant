@@ -135,6 +135,26 @@ def eject_cd():
     return False
 
 
+def play_fatal_error_sound(QtWidgets):
+    if sys.platform not in ('win32', 'darwin'):
+        player = shutil.which('paplay') or shutil.which('pw-play') or shutil.which('ffplay')
+        sound = next((path for path in (
+            Path('/usr/share/sounds/Oxygen-Sys-App-Error-Critical.ogg'),
+            Path('/usr/share/sounds/deepin/stereo/dialog-error-critical.wav'),
+            Path('/usr/share/sounds/freedesktop/stereo/dialog-error.oga'),
+        ) if path.is_file()), None)
+        if player and sound:
+            command = [player, str(sound)]
+            if Path(player).stem == 'ffplay':
+                command = [player, '-nodisp', '-autoexit', '-loglevel', 'quiet', str(sound)]
+            try:
+                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+    play_error_sound(QtWidgets)
+
+
 def play_error_sound(QtWidgets):
     if sys.platform == 'win32':
         import winsound

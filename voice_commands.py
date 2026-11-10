@@ -694,7 +694,11 @@ class WakeWordListener:
 
 
 def interpret_voice_command(transcript):
-    text = re.sub(r"[^a-z0-9']+", " ", transcript.lower()).strip()
+    simon = re.fullmatch(r'\s*simon\s+says\b[\s,:]*(.*?)\s*', transcript, flags=re.IGNORECASE | re.DOTALL)
+    if simon is not None:
+        payload = simon.group(1).strip()
+        return 'simon_says:' + payload if payload else None
+    text = re.sub(r"[^a-z0-9']+", " ", transcript.lower().replace("’", "'")).strip()
     text = re.sub(r"\bdid\s+not\b", "didn't", text)
     words = set(text.split())
 
@@ -723,6 +727,8 @@ def interpret_voice_command(transcript):
         return "time_query"
     if contains("what day is it"):
         return "date_query"
+    if re.fullmatch(r"(?:what's|what is) the (?:current )?weather(?: right now)?", text):
+        return "weather_query"
     if any(contains(phrase) for phrase in (
         "i didn't say your name",
         "i didnt say your name",

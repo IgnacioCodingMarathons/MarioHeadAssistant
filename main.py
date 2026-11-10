@@ -1,4 +1,5 @@
 import json
+import io
 import math
 from datetime import datetime
 import os
@@ -23,6 +24,7 @@ from desktop_support import (
     eject_cd,
     get_system_volume,
     play_error_sound,
+    play_fatal_error_sound,
     play_information_sound,
     play_task_complete_sound,
     set_system_volume,
@@ -34,6 +36,8 @@ from window_policy import (
     set_sdl_window_attention,
 )
 from pet_care import PetNeeds, create_pet_care_window
+from sentence_mixer import LiveSentenceMixer
+from weather_service import WeatherService, weather_failure_message
 from voice_commands import (
     MicrophoneCapture,
     SpeechTranscriber,
@@ -147,6 +151,55 @@ def decode_first_frame(ffmpeg: str, video: Path, start_time=0.0) -> pygame.Surfa
     if len(result.stdout) != FRAME_BYTES:
         raise RuntimeError(f"Could not decode the first frame of {video.name}.")
     return pygame.image.frombuffer(result.stdout, VIDEO_SIZE, "RGB").copy()
+
+
+def format_spoken_time(moment):
+    hour = moment.hour % 12 or 12
+    period = 'A M' if moment.hour < 12 else 'P M'
+    return f"It's {hour}:{moment.minute:02d} {period}."
+
+
+def format_spoken_date(moment):
+    weekdays = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+    months = ('January', 'February', 'March', 'April', 'May', 'June',
+              'July', 'August', 'September', 'October', 'November', 'December')
+    day = moment.day
+    suffix = 'th' if 11 <= day % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
+    return f"Today's {weekdays[moment.weekday()]}, {months[moment.month - 1]} {day}{suffix}, {moment.year}"
+
+
+def create_sentence_captions(text, size):
+    font = pygame.font.Font(None, 48)
+    lines = []
+    line = ""
+    for word in str(text).split():
+        candidate = f"{line} {word}".strip()
+        if line and font.size(candidate)[0] > size[0] - 40:
+            lines.append(line.strip())
+            line = ""
+        for character in word:
+            if line and font.size(line + character)[0] > size[0] - 40:
+                lines.append(line.strip())
+                line = ""
+            line += character
+        line += " "
+    if line.strip():
+        lines.append(line.strip())
+    line_height = font.get_linesize()
+    lines_per_page = max(1, (size[1] - 40) // line_height)
+    pages = []
+    for offset in range(0, len(lines), lines_per_page):
+        page_lines = lines[offset:offset + lines_per_page]
+        overlay = pygame.Surface(size, pygame.SRCALPHA)
+        height = len(page_lines) * line_height + 16
+        top = size[1] - height - 12
+        pygame.draw.rect(overlay, (0, 0, 0, 175), (10, top, size[0] - 20, height), border_radius=8)
+        for index, line in enumerate(page_lines):
+            label = font.render(line, True, (255, 255, 255))
+            rectangle = label.get_rect(center=(size[0] // 2, top + 8 + line_height * (index + 0.5)))
+            overlay.blit(label, rectangle)
+        pages.append(overlay)
+    return pages
 
 
 def start_decoder(ffmpeg: str, video: Path, start_time=0.0, duration=None):
@@ -365,12 +418,14 @@ def create_voice_commands_window(QtCore, QtWidgets):
         "Pet Care: ‘pet care’.\n"
         "Settings: ‘settings’ or ‘configure’.\n"
         "Speak: ‘speak’ or ‘say something’.\n"
+        "Repeat any text: ‘Simon says’ followed by what you want Mario to say.\n"
         "Oh, sorry!: ‘I didn’t say your name’ or ‘I didn’t call you’.\n"
         "Volume: ‘set volume to’, ‘lower volume by’, or ‘increase volume by’ with a number from 0 to 100; optionally add ‘percent’.\n"
         "Current volume: ‘what’s the volume’, ‘what’s the current volume’, or ‘what is the volume’ (optionally ‘current’).\n"
         "Repeat the last request: ‘what did you hear’ or ‘what’d you hear’.\n"
         "Time: ‘what’s the time’, ‘what is the time’, or ‘what time is it’.\n"
         "Date: ‘what day is it’.\n"
+        "Weather: ‘what’s the weather’ or ‘what is the weather’; optionally add ‘current’ before ‘weather’ and ‘right now’ afterward.\n"
         "Quench hunger or thirst: ‘quench’ with ‘hunger’ or ‘thirst’ (optionally say ‘Mario’s’).\n"
         "Show this list: ‘voice command’ or ‘voice commands’; optionally add ‘see’ and ‘Mario’s’, then ‘list’, ‘to say’, or ‘to use’."
     )
@@ -970,6 +1025,7 @@ def main() -> None:
         "speech_enable_smart_vosk", "speech_enable_google",
         "speech_enable_wake_word",
         "autofeed",
+        "tts_live_sentence_mixing",
     ):
         preferences[name] = bool(preferences[name])
     if preferences["wake_word_sensitivity"] == 0:
@@ -1053,8 +1109,48 @@ def main() -> None:
         pygame.mixer.init(frequency=44_100, size=-16, channels=2, buffer=1024)
         voice_beep_sound = create_beep_sound(pygame)
         voice_beep_channel = pygame.mixer.Channel(7)
+        mario_tts_channel = pygame.mixer.Channel(6)
+        sentence_mixer_sound = [None]
         voice_transcriber = SpeechTranscriber(ASSETS, preferences)
         voice_transcriber.initialize_gpu()
+        sentence_mixer = LiveSentenceMixer(ASSETS, ffmpeg)
+        sentence_mixer.set_enabled(preferences["tts_live_sentence_mixing"])
+        sentence_mix_results = queue.Queue()
+        weather_results = queue.Queue()
+        weather_service = WeatherService(preferences['weather_city'], preferences['weather_country_code'])
+        sentence_mix_generation = [0]
+        mixed_caption = None
+        mixed_video_path = None
+        mixed_caption_page = -1
+
+        def speak_mario_text(text):
+            if preferences["tts_live_sentence_mixing"]:
+                sentence_mix_generation[0] += 1
+                generation = sentence_mix_generation[0]
+
+                def synthesize():
+                    media = sentence_mixer.mix(text, with_video=True)
+                    if media is not None:
+                        sentence_mix_results.put((generation, media))
+
+                threading.Thread(target=synthesize, daemon=True).start()
+                return True
+            return speak_text(text)
+
+        def request_weather():
+            sentence_mix_generation[0] += 1
+            generation = sentence_mix_generation[0]
+            service = weather_service
+
+            def query():
+                try:
+                    weather_results.put((generation, service.get_report(), None))
+                except Exception as exc:
+                    message = weather_failure_message(exc)
+                    weather_results.put((generation, None, (exc, message)))
+
+            threading.Thread(target=query, daemon=True).start()
+
         voice_results = queue.Queue()
         wake_events = queue.Queue()
         wake_listener = WakeWordListener(voice_transcriber, wake_events)
@@ -1301,7 +1397,10 @@ def main() -> None:
             nonlocal next_eye_at, random_events_ready_at, feeding_active
             nonlocal feeding_is_rejection, feeding_is_autofeed, feeding_need
             nonlocal post_greeting_tween, move_tween, greeting_tween_started, is_greeting
-            nonlocal voice_silence_mode
+            nonlocal voice_silence_mode, mixed_caption
+            sentence_mix_generation[0] += 1
+            mixed_caption = None
+            mario_tts_channel.stop()
             voice_silence_mode = True
             pygame.mixer.stop()
             eating_channel.stop()
@@ -1579,6 +1678,11 @@ def main() -> None:
                     last_window_position = observed
             for name, value in settings_changes:
                 preferences[name] = value
+                if name == "tts_live_sentence_mixing":
+                    sentence_mixer.set_enabled(value)
+                if name in ('weather_city', 'weather_country_code'):
+                    weather_service = WeatherService(preferences['weather_city'], preferences['weather_country_code'])
+                    sentence_mix_generation[0] += 1
                 if name == "caring_difficulty":
                     pet.set_difficulty(value)
                 write_save_data(save_path, {name: value, **pet.snapshot()})
@@ -1920,6 +2024,9 @@ def main() -> None:
                 Gtk.main_iteration_do(False)
 
             if skip_requested or menu_action[0] == "stop":
+                sentence_mix_generation[0] += 1
+                mario_tts_channel.stop()
+                mixed_caption = None
                 stopped_from_menu = menu_action[0] == "stop"
                 if menu_action[0] == "stop":
                     menu_action[0] = None
@@ -2069,7 +2176,7 @@ def main() -> None:
                 if volume_percent is None:
                     print("MarioAssistant volume: couldn't read the system output volume", file=sys.stderr)
                 else:
-                    speak_text(f"The volume is set to {volume_percent} percent")
+                    speak_mario_text(f"The volume is set to {volume_percent} percent")
             elif selected_action == "eject_cd":
                 if eject_cd():
                     play_task_complete_sound(QtWidgets)
@@ -2077,21 +2184,15 @@ def main() -> None:
                     disappointment_sound.play()
             elif selected_action == "what_heard":
                 heard_text = last_heard_query or "I haven't heard a command yet"
-                speak_text(f'I heard: "{heard_text}"')
+                speak_mario_text(f'I heard: "{heard_text}"')
+            elif selected_action is not None and selected_action.startswith("simon_says:"):
+                speak_mario_text(selected_action.split(":", 1)[1])
             elif selected_action == "time_query":
-                current_time = datetime.now().strftime("%I:%M %p").lstrip("0")
-                speak_text(f"It's {current_time}")
+                speak_mario_text(format_spoken_time(datetime.now()))
+            elif selected_action == "weather_query":
+                request_weather()
             elif selected_action == "date_query":
-                current_date = datetime.now()
-                day = current_date.day
-                suffix = "th" if 11 <= day % 100 <= 13 else {
-                    1: "st", 2: "nd", 3: "rd",
-                }.get(day % 10, "th")
-                speak_text(
-                    f"Today's {current_date.strftime('%A')}, "
-                    f"{current_date.strftime('%B')} {day}{suffix}, "
-                    f"{current_date.year}"
-                )
+                speak_mario_text(format_spoken_date(datetime.now()))
             elif selected_action is not None and selected_action.startswith("volume_"):
                 operation, amount_text = selected_action.removeprefix("volume_").split(":", 1)
                 amount = float(amount_text)
@@ -2587,6 +2688,65 @@ def main() -> None:
                 greeting_tween_started = True
                 is_greeting = False
 
+            try:
+                generation, weather_report, weather_error = weather_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if (generation == sentence_mix_generation[0] and not goodbye_running
+                        and voice_state["phase"] == "idle"):
+                    if weather_error is not None:
+                        weather_error, failure_message = weather_error
+                        print(f"MarioAssistant weather: {type(weather_error).__name__}: {weather_error}",
+                              file=sys.stderr, flush=True)
+                        try:
+                            play_fatal_error_sound(QtWidgets)
+                        except Exception as sound_error:
+                            print(f"MarioAssistant weather: error sound failed: {sound_error}",
+                                  file=sys.stderr, flush=True)
+                        speak_mario_text(failure_message)
+                    else:
+                        try:
+                            play_task_complete_sound(QtWidgets)
+                        except Exception as sound_error:
+                            print(f"MarioAssistant weather: task-complete sound failed: {sound_error}",
+                                  file=sys.stderr, flush=True)
+                        speak_mario_text(weather_report)
+
+            try:
+                generation, mixed_media = sentence_mix_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if (generation == sentence_mix_generation[0] and not goodbye_running
+                        and voice_state["phase"] == "idle"):
+                    audio.stop()
+                    mario_tts_channel.stop()
+                    (
+                        audio, frame_surface, last_frame_surface, process,
+                        frames, stop, reader,
+                    ) = start_media(
+                        ffmpeg, temp_dir, video_texture, process, stop, reader,
+                        mixed_media["video"], play_audio=False,
+                    )
+                    sound = pygame.mixer.Sound(file=io.BytesIO(mixed_media["audio"]))
+                    sound.set_volume(MARIO_VOLUME)
+                    sentence_mixer_sound[0] = sound
+                    video = mixed_media["video"]
+                    mixed_video_path = video
+                    mixed_caption = create_sentence_captions(mixed_media["text"], VIDEO_SIZE)
+                    mixed_caption_page = -1
+                    started = time.monotonic()
+                    mario_tts_channel.play(sound)
+                    consumed = 0
+                    finished = False
+                    idle_playing = True
+                    hello_clip_deadline = None
+                    frame_dirty = True
+                    random_events_ready_at = started + sound.get_length() + 10
+                else:
+                    mixed_media["video"].unlink(missing_ok=True)
+
             if not finished:
                 target_frames = max(1, int((time.monotonic() - started) * VIDEO_FPS) + 1)
                 while consumed < target_frames:
@@ -2914,8 +3074,27 @@ def main() -> None:
                 last_frame_surface = greeting_first_surface
                 frame_dirty = True
 
+            if mixed_video_path is not None and (finished or video != mixed_video_path):
+                mario_tts_channel.stop()
+                mixed_caption = None
+                try:
+                    mixed_video_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                mixed_video_path = None
+                frame_dirty = True
+            if mixed_caption:
+                duration = max(0.001, sentence_mixer_sound[0].get_length())
+                page = max(0, min(len(mixed_caption) - 1, int((now - started) / duration * len(mixed_caption))))
+                if page != mixed_caption_page:
+                    mixed_caption_page = page
+                    frame_dirty = True
             if frame_dirty:
-                video_texture.update(frame_surface)
+                display_surface = frame_surface
+                if mixed_caption:
+                    display_surface = frame_surface.copy()
+                    display_surface.blit(mixed_caption[mixed_caption_page], (0, 0))
+                video_texture.update(display_surface)
                 frame_dirty = False
             width, height = window.size
             renderer.draw_color = (0, 0, 0, 255)

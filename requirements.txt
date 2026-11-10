@@ -5,3 +5,7 @@ pycaw; sys_platform == "win32"
 vosk>=0.3.45
 SpeechRecognition>=3.14.0
 pocketsphinx>=5.0.4
+num2words>=0.5.14
+pydub>=0.25.1
+sentence-mixing==2.0.4
+moviepy>=1.0.3,<2
