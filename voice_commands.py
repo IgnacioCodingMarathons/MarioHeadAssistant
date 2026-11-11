@@ -328,7 +328,7 @@ class SpeechTranscriber:
             raise ValueError("Google recognition returned no speech")
         return transcript
 
-    def transcribe(self, samples):
+    def transcribe(self, samples, progress_callback=None):
         if not samples:
             raise ValueError("No speech was captured")
         if self.preferences.get("speech_use_one_method_only", False):
@@ -340,8 +340,23 @@ class SpeechTranscriber:
         last_transcript = None
         last_engine = None
         errors = []
+        duration = len(samples) / max(1, SAMPLE_RATE * 2)
+        estimates = {
+            'vosk_quick': max(0.5, duration * 0.35 + 0.2),
+            'vosk_smart': max(1.0, duration * 1.15 + 0.5),
+            'google': max(2.0, duration * 0.25 + 1.5),
+        }
+        total_estimate = sum(estimates.get(method, 0.5) for method in methods) or 1.0
+        completed_estimate = 0.0
+        if progress_callback:
+            progress_callback('Transcribing...', 0.0, total_estimate)
         for method in methods:
+            method_estimate = estimates.get(method, 0.5)
+            if progress_callback:
+                progress_callback('Transcribing...', completed_estimate / total_estimate,
+                                  max(0.15, total_estimate - completed_estimate))
             if method not in self.model_paths and method != "google":
+                completed_estimate += method_estimate
                 continue
             engine = "google" if method == "google" else method
             if not self._method_enabled(method):
@@ -352,6 +367,7 @@ class SpeechTranscriber:
                     file=sys.stderr,
                     flush=True,
                 )
+                completed_estimate += method_estimate
                 continue
             try:
                 transcript = (
@@ -369,8 +385,18 @@ class SpeechTranscriber:
                     file=sys.stderr,
                     flush=True,
                 )
+                completed_estimate += method_estimate
+                if progress_callback:
+                    progress_callback('Transcribing...', completed_estimate / total_estimate,
+                                      max(0.15, total_estimate - completed_estimate))
                 continue
+            if progress_callback:
+                progress_callback('Transcribing...', min(1.0, (completed_estimate + method_estimate) / total_estimate), 0.2)
+            if progress_callback:
+                progress_callback('Processing...', 0.0, 0.35)
             action = interpret_voice_command(transcript)
+            if progress_callback:
+                progress_callback('Processing...', 1.0, 0.15)
             label = {
                 "vosk_quick": "Vosk (quick)",
                 "vosk_smart": "Vosk (smart)",
@@ -390,6 +416,7 @@ class SpeechTranscriber:
             if action is not None:
                 self.last_engine = method
                 return transcript, method, action
+            completed_estimate += method_estimate
         if last_transcript is not None:
             print(
                 "MarioAssistant voice: no enabled recognition method matched a command",

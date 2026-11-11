@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 import queue
 import random
+import re
 import secrets
 import shutil
 import subprocess
@@ -36,7 +37,8 @@ from window_policy import (
     set_sdl_window_attention,
 )
 from pet_care import PetNeeds, create_pet_care_window
-from sentence_mixer import LiveSentenceMixer
+from sentence_mixer import LiveSentenceMixer, normalize_numbers
+from sentence_mixer_passages import compatibility_tts_text, format_subtitle_text, tokenize_variant_text
 from weather_service import WeatherService, weather_failure_message
 from voice_commands import (
     MicrophoneCapture,
@@ -202,6 +204,30 @@ def create_sentence_captions(text, size):
     return pages
 
 
+def create_voice_progress_window(QtCore, QtWidgets):
+    dialog = QtWidgets.QDialog()
+    dialog.setWindowTitle('Please wait...')
+    dialog.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+    dialog.setModal(False)
+    dialog.setFixedWidth(460)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    stage_label = QtWidgets.QLabel('Transcribing... (ETA: estimating)')
+    stage_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(stage_label)
+    stage_bar = QtWidgets.QProgressBar()
+    stage_bar.setRange(0, 100)
+    layout.addWidget(stage_bar)
+    total_layout = QtWidgets.QHBoxLayout()
+    total_label = QtWidgets.QLabel('Total:')
+    total_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+    total_layout.addWidget(total_label)
+    total_bar = QtWidgets.QProgressBar()
+    total_bar.setRange(0, 100)
+    total_layout.addWidget(total_bar, 1)
+    layout.addLayout(total_layout)
+    return dialog, stage_label, stage_bar, total_bar
+
+
 def start_decoder(ffmpeg: str, video: Path, start_time=0.0, duration=None):
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(video)]
     if start_time > 0:
@@ -290,6 +316,7 @@ def create_context_menu(Gtk, menu_action, stop_only=False):
         ("Quench thirst", "quench_thirst"),
         ("Mario's voice command list", "commands"),
         ("Hello", "hello"),
+        ("Make me say anything!", "say_anything"),
         ("Goodbye", "goodbye"),
     )
     for label, action in options:
@@ -392,6 +419,32 @@ def create_minigames_window(QtWidgets, minigame_action, roll_sound):
     layout.addWidget(game_list)
     layout.addWidget(play_button)
     layout.addWidget(roll_button)
+    return window
+
+
+def create_say_anything_window(QtCore, QtWidgets, menu_action):
+    window = QtWidgets.QWidget()
+    window.setWindowTitle("I'll say anything!")
+    window.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+    layout = QtWidgets.QHBoxLayout(window)
+    text_input = QtWidgets.QLineEdit()
+    say_button = QtWidgets.QPushButton("Say!")
+    say_button.setEnabled(False)
+
+    def submit():
+        text = text_input.text().strip()
+        if text:
+            menu_action[0] = "simon_says:" + text
+
+    text_input.textChanged.connect(
+        lambda text: say_button.setEnabled(bool(text.strip()))
+    )
+    text_input.returnPressed.connect(submit)
+    say_button.clicked.connect(submit)
+    layout.addWidget(text_input)
+    layout.addWidget(say_button)
+    window.resize(320, window.sizeHint().height())
+    window._text_input = text_input
     return window
 
 
@@ -604,6 +657,7 @@ def show_context_menu(Gtk, Gdk, menu_action, active_menu, stop_only=False):
             ("Quench thirst", "quench_thirst"),
             ("Mario's voice command list", "commands"),
             ("Hello", "hello"),
+            ("Make me say anything!", "say_anything"),
             ("Goodbye", "goodbye"),
         )
         for label, action in options:
@@ -669,6 +723,7 @@ def create_tray_menu(QtWidgets, tray, menu_action, live_values):
         ("Quench thirst", "quench_thirst"),
         ("Mario's voice command list", "commands"),
         ("Hello", "hello"),
+        ("Make me say anything!", "say_anything"),
         ("Goodbye", "goodbye"),
     ):
         action = menu.addAction(label)
@@ -1110,6 +1165,94 @@ def main() -> None:
         voice_beep_sound = create_beep_sound(pygame)
         voice_beep_channel = pygame.mixer.Channel(7)
         mario_tts_channel = pygame.mixer.Channel(6)
+        wait_dialog, wait_stage_label, wait_stage_bar, wait_total_bar = create_voice_progress_window(
+            QtCore, QtWidgets
+        )
+        wait_state = {'stage': None, 'started': 0.0, 'estimate': 1.0, 'reported': 0.0,
+                      'close_at': None, 'total': 0.0, 'hmm_active': False,
+                      'hmm_deadline': None}
+        wait_stage_ranges = {
+            'Transcribing...': (0, 60),
+            'Processing...': (60, 20),
+            'Sentence mixing...': (80, 20),
+        }
+
+        def stop_wait_hmm():
+            nonlocal audio, process, reader, stop, frames, finished, frame_surface
+            nonlocal last_frame_surface, frame_dirty, consumed, video
+            if not wait_state['hmm_active']:
+                return
+            audio.stop()
+            stop_decoder(process, stop, reader)
+            process = None
+            reader = None
+            stop = threading.Event()
+            frames = queue.Queue()
+            finished = True
+            if last_frame_surface is not None:
+                frame_surface = last_frame_surface
+                frame_dirty = True
+            video = ASSETS / 'greeting.avi'
+            wait_state['hmm_active'] = False
+            wait_state['hmm_deadline'] = None
+
+        def play_wait_hmm():
+            nonlocal audio, frame_surface, last_frame_surface, process, frames, stop, reader
+            nonlocal video, started, consumed, finished, frame_dirty
+            stop_wait_hmm()
+            audio.stop()
+            stop_decoder(process, stop, reader)
+            (
+                audio, frame_surface, last_frame_surface, process,
+                frames, stop, reader,
+            ) = start_media(
+                ffmpeg, temp_dir, video_texture, process, stop, reader,
+                ASSETS / 'niceplace.avi',
+            )
+            video = ASSETS / 'niceplace.avi'
+            started = time.monotonic()
+            consumed = 0
+            finished = False
+            frame_dirty = False
+            wait_state['hmm_active'] = True
+            wait_state['hmm_deadline'] = started + 1.15
+
+        def enter_wait_stage(stage, progress=0.0, estimate=1.0):
+            now = time.monotonic()
+            if stage != wait_state['stage']:
+                wait_state['stage'] = stage
+                wait_state['started'] = now
+                wait_state['reported'] = 0.0
+                play_wait_hmm()
+            wait_state['estimate'] = max(0.15, float(estimate))
+            wait_state['reported'] = max(wait_state['reported'], min(1.0, float(progress)))
+            wait_state['close_at'] = None
+            if not wait_dialog.isVisible():
+                wait_dialog.show()
+                wait_dialog.raise_()
+            update_wait_progress(now)
+
+        def update_wait_progress(now=None):
+            now = time.monotonic() if now is None else now
+            stage = wait_state['stage']
+            if stage is None or not wait_dialog.isVisible():
+                return
+            estimate = wait_state['estimate']
+            elapsed = max(0.0, now - wait_state['started'])
+            progress = max(wait_state['reported'], min(0.95, elapsed / estimate * 0.85))
+            eta = max(0, math.ceil(estimate - elapsed))
+            wait_stage_label.setText(f'{stage} (ETA: {eta} s)')
+            wait_stage_bar.setValue(round(progress * 100))
+            base, span = wait_stage_ranges[stage]
+            wait_total_bar.setValue(min(100, round(base + span * progress)))
+            if wait_state['close_at'] is not None and now >= wait_state['close_at']:
+                stop_wait_hmm()
+                wait_state['stage'] = None
+                wait_state['total'] = 100.0
+                wait_stage_bar.setValue(100)
+                wait_total_bar.setValue(100)
+                wait_dialog.hide()
+
         sentence_mixer_sound = [None]
         voice_transcriber = SpeechTranscriber(ASSETS, preferences)
         voice_transcriber.initialize_gpu()
@@ -1122,20 +1265,40 @@ def main() -> None:
         mixed_caption = None
         mixed_video_path = None
         mixed_caption_page = -1
+        mixed_caption_started = [0.0]
+        mixed_caption_duration = [0.0]
 
         def speak_mario_text(text):
+            nonlocal mixed_caption, mixed_caption_page, frame_dirty
+            mixed_caption = None
+            mixed_caption_page = -1
             if preferences["tts_live_sentence_mixing"]:
+                words = max(1, len(re.findall(r'[A-Za-z]+', text)))
+                enter_wait_stage('Sentence mixing...', 0.0, max(2.0, 0.6 + words * 0.22))
                 sentence_mix_generation[0] += 1
                 generation = sentence_mix_generation[0]
 
                 def synthesize():
-                    media = sentence_mixer.mix(text, with_video=True)
-                    if media is not None:
-                        sentence_mix_results.put((generation, media))
+                    try:
+                        media = sentence_mixer.mix(text, with_video=True)
+                    except Exception as exc:
+                        media = None
+                        print(f'MarioAssistant TTS: sentence-mixing failed: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+                    sentence_mix_results.put((generation, media))
 
                 threading.Thread(target=synthesize, daemon=True).start()
                 return True
-            return speak_text(text)
+            spoken_text = compatibility_tts_text(text, normalize_numbers)
+            cleaned, _, _, options, _ = tokenize_variant_text(text, normalize_numbers)
+            subtitle_text = format_subtitle_text(cleaned, options, normalize_numbers)
+            if subtitle_text:
+                mixed_caption = create_sentence_captions(subtitle_text, VIDEO_SIZE)
+                mixed_caption_page = -1
+                mixed_caption_started[0] = time.monotonic()
+                mixed_caption_duration[0] = max(1.0, len(spoken_text.split()) / 2.5)
+            mixed_caption_duration[0] = max(0.0, mixed_caption_duration[0] if subtitle_text else 0.0)
+            frame_dirty = True
+            return speak_text(spoken_text)
 
         def request_weather():
             sentence_mix_generation[0] += 1
@@ -1152,6 +1315,7 @@ def main() -> None:
             threading.Thread(target=query, daemon=True).start()
 
         voice_results = queue.Queue()
+        voice_progress_events = queue.Queue()
         wake_events = queue.Queue()
         wake_listener = WakeWordListener(voice_transcriber, wake_events)
 
@@ -1165,8 +1329,6 @@ def main() -> None:
         voice_request_active = False
         voice_request_action = None
         last_heard_query = None
-        voice_animation_deadline = 0.0
-        voice_animation_done = False
         voice_keys_down = set()
         voice_control_keys = {pygame.K_LCTRL, pygame.K_RCTRL}
         voice_shift_keys = {pygame.K_LSHIFT, pygame.K_RSHIFT}
@@ -1211,7 +1373,11 @@ def main() -> None:
 
         def transcribe_voice(samples):
             try:
-                transcript, engine, action = voice_transcriber.transcribe(samples)
+                def report_progress(stage, progress, estimate):
+                    voice_progress_events.put((stage, progress, estimate))
+                transcript, engine, action = voice_transcriber.transcribe(
+                    samples, progress_callback=report_progress
+                )
                 voice_results.put((transcript, None, action))
             except Exception as exc:
                 voice_results.put((None, exc, None))
@@ -1346,6 +1512,7 @@ def main() -> None:
 
         minigames_window = None
         voice_commands_window = None
+        say_anything_window = None
         debug_window = None
         debug_update = None
         last_debug_schedule_update = 0.0
@@ -1485,6 +1652,18 @@ def main() -> None:
             clock.tick(60)
             qt_app.processEvents()
             now = time.monotonic()
+            while True:
+                try:
+                    progress_stage, progress_value, progress_eta = voice_progress_events.get_nowait()
+                except queue.Empty:
+                    break
+                enter_wait_stage(progress_stage, progress_value, progress_eta)
+                if progress_value >= 1.0:
+                    stop_wait_hmm()
+            update_wait_progress(now)
+            if (wait_state['hmm_active'] and wait_state['hmm_deadline'] is not None
+                    and now >= wait_state['hmm_deadline']):
+                stop_wait_hmm()
             try:
                 wake_transcript = wake_events.get_nowait()
             except queue.Empty:
@@ -1537,7 +1716,6 @@ def main() -> None:
                         voice_results.put((None, voice_state["error"], None))
                     elif voice_state["samples"] is not None:
                         voice_processing = True
-                        voice_animation_done = False
                         audio.stop()
                         if pet_video is not None:
                             finish_pet_alert()
@@ -1563,19 +1741,6 @@ def main() -> None:
                         post_greeting_tween = None
                         greeting_tween_started = True
                         is_greeting = False
-                        (
-                            audio, frame_surface, last_frame_surface, process,
-                            frames, stop, reader,
-                        ) = start_media(
-                            ffmpeg, temp_dir, video_texture, process, stop, reader,
-                            ASSETS / "niceplace.avi",
-                        )
-                        video = ASSETS / "niceplace.avi"
-                        started = time.monotonic()
-                        consumed = 0
-                        finished = False
-                        frame_dirty = False
-                        voice_animation_deadline = started + 1.15
                         threading.Thread(
                             target=transcribe_voice,
                             args=(voice_state["samples"],),
@@ -1598,6 +1763,9 @@ def main() -> None:
             except queue.Empty:
                 pass
             else:
+                if wait_state['stage'] is not None:
+                    wait_state['close_at'] = time.monotonic() + 0.45
+                stop_wait_hmm()
                 if transcript and voice_action != "what_heard":
                     last_heard_query = transcript
                 if voice_processing:
@@ -1650,14 +1818,6 @@ def main() -> None:
                     if voice_action == "random_minigame"
                     else voice_action or "voice_unrecognized"
                 )
-            if voice_processing and not voice_animation_done and now >= voice_animation_deadline:
-                audio.stop()
-                if not finished:
-                    stop_decoder(process, stop, reader)
-                    finished = True
-                if frame_surface is not None:
-                    last_frame_surface = frame_surface
-                voice_animation_done = True
             if pet.tick():
                 if not voice_silence_mode:
                     disappointment_sound.play()
@@ -2309,7 +2469,7 @@ def main() -> None:
                         print(f"MarioAssistant notification: {exc}", file=sys.stderr)
                 pet_notification_close_at.clear()
                 write_save_data(save_path, pet.snapshot())
-                for auxiliary in (settings_window, minigames_window, debug_window, care_window, voice_commands_window):
+                for auxiliary in (settings_window, minigames_window, debug_window, care_window, voice_commands_window, say_anything_window):
                     if auxiliary is not None:
                         auxiliary.hide()
                 goodbye_completed = run_goodbye(
@@ -2339,6 +2499,15 @@ def main() -> None:
                 settings_window.show()
                 settings_window.raise_()
                 settings_window.activateWindow()
+            elif selected_action == "say_anything":
+                if say_anything_window is None:
+                    say_anything_window = create_say_anything_window(
+                        QtCore, QtWidgets, menu_action
+                    )
+                say_anything_window.show()
+                say_anything_window.raise_()
+                say_anything_window.activateWindow()
+                say_anything_window._text_input.setFocus()
             elif selected_action == "commands":
                 if voice_commands_window is None:
                     voice_commands_window = create_voice_commands_window(
@@ -2718,8 +2887,16 @@ def main() -> None:
             except queue.Empty:
                 pass
             else:
-                if (generation == sentence_mix_generation[0] and not goodbye_running
-                        and voice_state["phase"] == "idle"):
+                if (generation != sentence_mix_generation[0] or goodbye_running
+                        or voice_state["phase"] != "idle"):
+                    if mixed_media is not None:
+                        mixed_media["video"].unlink(missing_ok=True)
+                elif mixed_media is None:
+                    stop_wait_hmm()
+                    if wait_state['stage'] is not None:
+                        wait_state['close_at'] = time.monotonic() + 0.25
+                else:
+                    stop_wait_hmm()
                     audio.stop()
                     mario_tts_channel.stop()
                     (
@@ -2742,10 +2919,13 @@ def main() -> None:
                     finished = False
                     idle_playing = True
                     hello_clip_deadline = None
+                    mixed_caption_started[0] = started
+                    mixed_caption_duration[0] = max(0.1, sound.get_length())
+                    wait_state['reported'] = 1.0
+                    wait_state['close_at'] = time.monotonic() + 0.35
+                    update_wait_progress()
                     frame_dirty = True
                     random_events_ready_at = started + sound.get_length() + 10
-                else:
-                    mixed_media["video"].unlink(missing_ok=True)
 
             if not finished:
                 target_frames = max(1, int((time.monotonic() - started) * VIDEO_FPS) + 1)
@@ -2756,6 +2936,9 @@ def main() -> None:
                         break
                     if data is None:
                         finished = True
+                        if wait_state['hmm_active']:
+                            audio.stop()
+                            wait_state['hmm_active'] = False
                         random_events_ready_at = time.monotonic() + 10
                         if hello_clip_deadline is None:
                             frame_surface = last_frame_surface
@@ -3077,6 +3260,7 @@ def main() -> None:
             if mixed_video_path is not None and (finished or video != mixed_video_path):
                 mario_tts_channel.stop()
                 mixed_caption = None
+                mixed_caption_duration[0] = 0.0
                 try:
                     mixed_video_path.unlink(missing_ok=True)
                 except OSError:
@@ -3084,11 +3268,17 @@ def main() -> None:
                 mixed_video_path = None
                 frame_dirty = True
             if mixed_caption:
-                duration = max(0.001, sentence_mixer_sound[0].get_length())
-                page = max(0, min(len(mixed_caption) - 1, int((now - started) / duration * len(mixed_caption))))
-                if page != mixed_caption_page:
-                    mixed_caption_page = page
+                duration = max(0.001, mixed_caption_duration[0])
+                elapsed_caption = max(0.0, now - mixed_caption_started[0])
+                if elapsed_caption >= duration:
+                    mixed_caption = None
+                    mixed_caption_page = -1
                     frame_dirty = True
+                else:
+                    page = max(0, min(len(mixed_caption) - 1, int(elapsed_caption / duration * len(mixed_caption))))
+                    if page != mixed_caption_page:
+                        mixed_caption_page = page
+                        frame_dirty = True
             if frame_dirty:
                 display_surface = frame_surface
                 if mixed_caption:

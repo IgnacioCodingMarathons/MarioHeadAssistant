@@ -33,7 +33,7 @@ def ensure_complete_search():
     analyze.compute_children = complete_children
 
 
-def complete_selected_phonemes(combo, videos):
+def complete_selected_phonemes(combo, videos, prefer_recorded=True):
     from sentence_mixing.logic.global_audio_data import audioDataFactory
     from sentence_mixing.logic.randomizer import Randomizer
     from sentence_mixing.sentence_mixer import get_global_randomizer_from_videos
@@ -55,4 +55,57 @@ def complete_selected_phonemes(combo, videos):
                     raise PhonemError(phone)
                 association = max(candidates, key=lambda candidate: candidate.get_total_score())
             selected.append(association.audio_phonem)
-    return selected
+    return prefer_recorded_words(target, selected, videos) if prefer_recorded else selected
+
+
+def prefer_recorded_words(target, selected, videos):
+    def key(word):
+        return word.token, tuple(phone.transcription for phone in word.phonems)
+
+    lookup = {}
+    for video in videos:
+        for subtitle in video.subtitles:
+            for word in subtitle.words:
+                if word.token != '<BLANK>':
+                    lookup.setdefault(key(word), []).append(word)
+    pieces = []
+    offset = 0
+    for word in target.words:
+        size = len(word.phonems)
+        pieces.append(selected[offset:offset + size])
+        offset += size
+    result = []
+    index = 0
+    while index < len(target.words):
+        word = target.words[index]
+        best = None
+        for candidate in lookup.get(key(word), []):
+            cursor = candidate
+            chain = []
+            count = 0
+            gap_total = 0
+            matches = 0
+            while index + count < len(target.words) and cursor is not None:
+                wanted = target.words[index + count]
+                if wanted.token == '<BLANK>' or key(cursor) != key(wanted):
+                    break
+                chain.extend(cursor.phonems)
+                matches += sum(first is second for first, second in zip(pieces[index + count], cursor.phonems))
+                count += 1
+                following = cursor.next_in_seq()
+                if following is not None:
+                    gap = following.start - cursor.end
+                    if gap < -1 / 16000 or gap > 0.08:
+                        break
+                    gap_total += gap
+                cursor = following
+            rank = (count, matches, -gap_total)
+            if best is None or rank > best[0]:
+                best = (rank, chain, count)
+        if best is None:
+            result.extend(pieces[index])
+            index += 1
+        else:
+            result.extend(best[1])
+            index += best[2]
+    return result
