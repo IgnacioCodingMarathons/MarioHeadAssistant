@@ -179,7 +179,7 @@ def play_error_sound(QtWidgets):
         QtWidgets.QApplication.beep()
 
 
-def speak_text(text):
+def speak_text(text, language=None):
     if sys.platform == 'win32':
         script = "$text = [Console]::In.ReadToEnd(); Add-Type -AssemblyName System.Speech; $speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer; $speaker.Speak($text)"
         process = subprocess.Popen(
@@ -194,10 +194,17 @@ def speak_text(text):
         return True
     if sys.platform == 'darwin':
         player = shutil.which('say')
-        command = [player, text] if player else None
+        voice = 'Monica' if language == 'es' else None
+        command = [player, *(['-v', voice] if voice else []), text] if player else None
     else:
-        player = shutil.which('spd-say') or shutil.which('espeak-ng') or shutil.which('espeak')
-        command = [player, text] if player else None
+        player = (shutil.which('espeak-ng') or shutil.which('espeak')) if language == 'es' else (
+            shutil.which('spd-say') or shutil.which('espeak-ng') or shutil.which('espeak')
+        )
+        if player:
+            voice = 'es-la' if shutil.which('espeak-ng') == player else 'es'
+            command = [player, *(['-v', voice] if language == 'es' else []), text]
+        else:
+            command = None
     if not command:
         return False
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

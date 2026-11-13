@@ -139,8 +139,103 @@ def format_weather_report(data):
         f"Right now is {temperature_text(current['temperature_2m'])} degrees Celsius "
         f"with a low of {temperature_text(daily['temperature_2m_min'][today])} degrees Celsius "
         f"and a high of {temperature_text(daily['temperature_2m_max'][today])} degrees Celsius. "
+        "\\pause=500\\"
         f'Today, you can expect {today_description}, and you can expect '
         f'{later_description} {ending}.'
+    )
+
+
+def wind_level(speed):
+    speed = float(speed)
+    if not math.isfinite(speed) or speed < 0:
+        raise ValueError('The weather service returned an invalid wind speed')
+    if speed < 6:
+        return 'calm'
+    if speed < 12:
+        return 'light'
+    if speed < 20:
+        return 'moderate'
+    if speed < 29:
+        return 'fresh'
+    if speed < 39:
+        return 'strong'
+    if speed < 50:
+        return 'near-gale'
+    if speed < 62:
+        return 'gale-force'
+    if speed < 75:
+        return 'strong gale-force'
+    if speed < 89:
+        return 'storm-force'
+    return 'violent storm-force'
+
+
+def windy_description(speed):
+    speed = float(speed)
+    if speed < 6:
+        return 'calm'
+    if speed < 12:
+        return 'a little breezy'
+    if speed < 20:
+        return 'breezy'
+    if speed < 29:
+        return 'windy'
+    if speed < 39:
+        return 'very windy'
+    if speed < 50:
+        return 'quite windy'
+    return 'extremely windy'
+
+
+def forecast_wind_description(speeds):
+    levels = []
+    for speed in speeds:
+        level = wind_level(speed)
+        if level not in levels:
+            levels.append(level)
+    if not levels:
+        raise ValueError('No later wind forecast is available')
+    if len(levels) == 1:
+        return f'{levels[0]} winds'
+    if len(levels) == 2:
+        return f'{levels[0]} to {levels[1]} winds'
+    return f'{", ".join(levels[:-1])} and {levels[-1]} winds'
+
+
+def format_wind_report(data):
+    current = data['current']
+    hourly = data['hourly']
+    now = int(current['time'])
+    daily = data.get('daily', {})
+    sunsets = daily.get('sunset', [])
+    sunset = next((int(value) for value in sunsets if int(value) > now), now + 18 * 3600)
+    future = [(int(timestamp), float(speed)) for timestamp, speed in
+              zip(hourly['time'], hourly['wind_speed_10m'])
+              if int(timestamp) > now and speed is not None]
+    next_hours = [speed for timestamp, speed in future if timestamp <= now + 3 * 3600]
+    if not next_hours:
+        next_hours = [speed for _, speed in future[:3]]
+    later = [speed for timestamp, speed in future if now + 5 * 3600 <= timestamp < sunset]
+    if not later:
+        later = [speed for timestamp, speed in future if timestamp < sunset]
+    if not later:
+        later = [speed for _, speed in future[3:6]] or next_hours
+    current_speed = float(current['wind_speed_10m'])
+    if not next_hours or not later:
+        raise ValueError('The weather service returned an incomplete wind forecast')
+    next_description = forecast_wind_description(next_hours)
+    later_description = forecast_wind_description(later)
+    if later_description == next_description:
+        later_description = 'more of the same'
+    speed_text = str(round(current_speed))
+    return (
+        f"Currently, it's {windy_description(current_speed)}. "
+        "\\pause=500\\"
+        f"There's {wind_level(current_speed)} winds around {speed_text} "
+        "\\showas=km/h\\kilometers \\hidden\\per \\hidden\\hour. "
+        "\\pause=500\\"
+        f'Expect {next_description} throughout the next few hours '
+        f'and {later_description} later on in the day.'
     )
 
 
@@ -153,6 +248,8 @@ class WeatherService:
         self.location_at = 0
         self.report = None
         self.report_at = 0
+        self.wind_report = None
+        self.wind_report_at = 0
 
     def _get_json(self, url):
         request = urllib.request.Request(url, headers={'User-Agent': 'MarioAssistant/1.0', 'Accept': 'application/json'})
@@ -213,4 +310,25 @@ class WeatherService:
             report = format_weather_report(data)
             self.report = report
             self.report_at = time.monotonic()
+            return report
+
+    def get_wind_report(self):
+        with self.lock:
+            if self.wind_report is not None and time.monotonic() - self.wind_report_at < 300:
+                return self.wind_report
+            latitude, longitude = self._coordinates()
+            query = urllib.parse.urlencode({
+                'latitude': latitude, 'longitude': longitude,
+                'current': 'wind_speed_10m',
+                'hourly': 'wind_speed_10m',
+                'daily': 'sunset',
+                'wind_speed_unit': 'kmh', 'timezone': 'auto',
+                'timeformat': 'unixtime', 'forecast_days': 2,
+            })
+            data = self._get_json('https://api.open-meteo.com/v1/forecast?' + query)
+            if data.get('error'):
+                raise RuntimeError(data.get('reason', 'Weather lookup failed'))
+            report = format_wind_report(data)
+            self.wind_report = report
+            self.wind_report_at = time.monotonic()
             return report

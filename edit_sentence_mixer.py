@@ -59,8 +59,6 @@ def edited_word(all_matches_text, start, end, rows, duration, rate):
             raise ValueError('Phonemes must be in order without overlapping.')
         previous = right
         phones.append((label, left / rate, right / rate))
-    if not phones:
-        raise ValueError('Add at least one phoneme, or use Fill phonemes to start.')
     return {'text': text, 'aliases': aliases, 'start': start / rate,
             'end': end / rate, 'phones': phones}
 
@@ -481,6 +479,9 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.phones.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.phones.itemChanged.connect(self.form_changed)
         right_layout.addWidget(self.phones)
+        self.no_phonemes = QtWidgets.QCheckBox('No phonemes for this word')
+        self.no_phonemes.toggled.connect(self.set_no_phonemes)
+        right_layout.addWidget(self.no_phonemes)
         phone_buttons = QtWidgets.QHBoxLayout()
         self.button(phone_buttons, '+ Phone', self.add_phone)
         self.button(phone_buttons, '− Phone', self.delete_phone)
@@ -510,6 +511,7 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.undo_action = self.add_menu_action(edit_menu, '&Undo', self.undo, 'Ctrl+Z')
         self.redo_action = self.add_menu_action(edit_menu, '&Redo', self.redo, 'Ctrl+Y')
         self.redo_action.setShortcuts([QtGui.QKeySequence('Ctrl+Y'), QtGui.QKeySequence('Ctrl+Shift+Z')])
+        self.find_action = self.add_menu_action(edit_menu, '&Find word…', self.find_word, 'Ctrl+F')
         application_menu = self.menuBar().addMenu('&Application')
         self.add_menu_action(application_menu, '&About', self.about, '')
         application_menu.addSeparator()
@@ -575,6 +577,11 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
             self.update_waveform_phonemes()
             self.update_title()
             self.waveform.set_range(self.start.value(), self.end.value())
+
+    def set_no_phonemes(self, enabled):
+        self.phones.setEnabled(not enabled)
+        if not self.loading:
+            self.form_changed()
 
     def update_title(self):
         name = self.path.name if self.path else 'No file'
@@ -646,6 +653,76 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open mixer index', str(self.path.parent if self.path else Path(__file__).parent / 'assets'), 'Mixer index (*.bin)')
         if path:
             self.open_file(Path(path))
+
+    def find_word(self):
+        if self.index is None or not self.commit_form():
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Find word in mixer index')
+        dialog.resize(760, 460)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        search = QtWidgets.QLineEdit()
+        search.setPlaceholderText('Search words and All matches across every clip')
+        layout.addWidget(search)
+        results = QtWidgets.QTableWidget(0, 4)
+        results.setHorizontalHeaderLabels(['Match', 'Clip', 'Start (s)', 'End (s)'])
+        results.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        results.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        results.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        results.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        results.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        results.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        results.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(results, 1)
+        hint = QtWidgets.QLabel('Double-click a result to open that clip and select the recorded instance.')
+        layout.addWidget(hint)
+
+        def refresh_results(query):
+            results.setRowCount(0)
+            query = query.strip().casefold()
+            if not query:
+                hint.setText('Type a word or phrase to search all clips and matches.')
+                return
+            found = []
+            for source_index, source in enumerate(self.index['sources']):
+                for word_index, record in enumerate(source['words']):
+                    candidates = [record['text'], *record.get('aliases', [])]
+                    matched = next((value for value in candidates if query in value.casefold()), None)
+                    if matched is not None:
+                        found.append((source_index, word_index, source, record, matched))
+            found.sort(key=lambda item: (item[2]['name'].casefold(), item[3]['start'], item[3]['end']))
+            for source_index, word_index, source, record, matched in found:
+                row = results.rowCount()
+                results.insertRow(row)
+                match_item = QtWidgets.QTableWidgetItem(matched)
+                match_item.setData(QtCore.Qt.ItemDataRole.UserRole, source_index)
+                match_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, word_index)
+                values = (matched, source['name'], f'{record["start"]:.6f}', f'{record["end"]:.6f}')
+                for column, value in enumerate(values):
+                    results.setItem(row, column, match_item if column == 0 else QtWidgets.QTableWidgetItem(value))
+            hint.setText(f'{len(found)} matching recording(s). Double-click a result to jump to it.')
+
+        def jump_to_result(item):
+            row = item.row()
+            match_item = results.item(row, 0)
+            source_index = match_item.data(QtCore.Qt.ItemDataRole.UserRole)
+            word_index = match_item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+            if source_index != self.source_index:
+                self.sources.setCurrentIndex(source_index)
+            self.tabs.setCurrentIndex(0)
+            self.refresh_words(word_index)
+            if word_index >= 0:
+                target = self.words.item(word_index, 0)
+                if target is not None:
+                    self.words.scrollToItem(target)
+                    self.words.selectRow(word_index)
+            dialog.accept()
+
+        search.textChanged.connect(refresh_results)
+        results.itemDoubleClicked.connect(jump_to_result)
+        dialog.show()
+        search.setFocus()
+        dialog.exec()
 
     def confirm_discard(self):
         if not self.dirty and not self.form_dirty:
@@ -752,6 +829,10 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.start.setValue(left)
         self.end.setValue(right)
         self.set_phone_rows(word['phones'] if word else [])
+        self.no_phonemes.blockSignals(True)
+        self.no_phonemes.setChecked(bool(word is not None and not word['phones']))
+        self.no_phonemes.blockSignals(False)
+        self.phones.setEnabled(not self.no_phonemes.isChecked())
         self.form_dirty = False
         self.loading = False
         self.waveform.set_range(left, right)
@@ -835,7 +916,8 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         if source is None:
             return False
         try:
-            word = edited_word(self.alias_text.toPlainText(), self.start.value(), self.end.value(), self.phone_rows(),
+            rows = [] if self.no_phonemes.isChecked() else self.phone_rows()
+            word = edited_word(self.alias_text.toPlainText(), self.start.value(), self.end.value(), rows,
                                source['length'] / 32000, self.index['sample_rate'])
         except (ValueError, OverflowError) as exc:
             self.error(str(exc))

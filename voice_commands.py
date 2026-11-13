@@ -756,6 +756,15 @@ def interpret_voice_command(transcript):
         return "date_query"
     if re.fullmatch(r"(?:what's|what is) the (?:current )?weather(?: right now)?", text):
         return "weather_query"
+    if re.fullmatch(r"(?:what's|what is) the (?:current )?wind(?: speed)?", text):
+        return "wind_query"
+    news = re.fullmatch(
+        r"tell me the latest news from (.+?)(?: in (text|audio))?", text
+    )
+    if news is not None:
+        network = news.group(1).strip()
+        mode = news.group(2) or "auto"
+        return f"news_query:{mode}:{network}" if network else None
     if any(contains(phrase) for phrase in (
         "i didn't say your name",
         "i didnt say your name",

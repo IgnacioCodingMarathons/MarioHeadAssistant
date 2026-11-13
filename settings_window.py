@@ -195,7 +195,7 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
 
     weather_page = QtWidgets.QWidget()
     weather_form = QtWidgets.QFormLayout(weather_page)
-    location_help = QtWidgets.QLabel('Choose a city for accurate weather. Leave it blank to use your approximate network location.')
+    location_help = QtWidgets.QLabel('Choose a city and country for weather and local news. Leave them blank to use your approximate network location.')
     location_help.setWordWrap(True)
     weather_form.addRow(location_help)
     for label, name in (('City', 'weather_city'), ('Country code (for example, AR)', 'weather_country_code')):

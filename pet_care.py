@@ -75,7 +75,7 @@ class PetNeeds:
             return self.caring_difficulty / 5
         return 1 + (self.caring_difficulty - 5) * 0.8
 
-    def tick(self, now=None):
+    def tick(self, now=None, paused=False):
         now = time.monotonic() if now is None else now
         elapsed = max(0, now - self.last_tick)
         self.last_tick = now
@@ -84,6 +84,8 @@ class PetNeeds:
             self.needy = {name: False for name in self.levels}
             self.reminders = {name: math.inf for name in self.levels}
             self.requested = None
+            return False
+        if paused:
             return False
         depleted = False
         drain_multiplier = self._drain_multiplier()

@@ -4,6 +4,9 @@ from difflib import SequenceMatcher
 
 TAG_CONTROL = re.compile(r'\\([^\\]+)\\')
 PAUSE_TOKEN = '\x00pause:'
+SILENT_TOKEN = '\x00silent'
+SIMULTANEOUS_TOKEN = '\x00simultaneous'
+ALL_VARIANTS = '\x00allvariants'
 PHONE_NAMES = {
     'AA': 'ah', 'AE': 'a', 'AH': 'uh', 'AO': 'aw', 'AW': 'ow', 'AY': 'eye',
     'EH': 'eh', 'ER': 'er', 'EY': 'ay', 'IH': 'ih', 'IY': 'ee', 'OW': 'oh',
@@ -42,6 +45,23 @@ def tokenize_variant_text(text, normalizer):
                 options['ignore_alias_display'] = True
             elif item.lower() == 'hidden':
                 options['hidden'] = True
+            elif item.lower() == 'silent':
+                options['silent'] = True
+            elif item.lower() == 'simul':
+                options['simul'] = True
+            elif item.lower() == 'wallowautovariantinc':
+                options['allow_auto_variant_inc'] = True
+            elif item.lower() == 'wplayallvariants':
+                options['play_all_variants'] = True
+            elif item.lower().startswith('wplayvariantsupuntil='):
+                try:
+                    options['play_variants_until'] = max(
+                        0, int(item.split('=', 1)[1].strip().strip('[]'))
+                    )
+                except ValueError:
+                    pass
+            elif item.lower().startswith('showas='):
+                options['show_as'] = item.split('=', 1)[1].strip()
             elif item.lower().startswith('custompronunword='):
                 value = item.split('=', 1)[1].strip().strip('[]').lower()
                 spoken = re.findall(r'[a-z]+', value)
@@ -98,17 +118,19 @@ def tokenize_variant_text(text, normalizer):
 
 
 def format_subtitle_text(cleaned, word_options, normalizer):
-    token_index = [0]
-
     def replace(match):
-        index = token_index[0]
-        token_index[0] += 1
         word = match.group(0)
         if word in (',', ';', '.', '!', '?'):
+            return word
+        prefix = normalizer(cleaned[:match.start()]).lower().replace("'", '')
+        index = len(re.findall(r'[a-z]+|[,;.!?]', prefix))
+        if word.isdigit():
             return word
         options = word_options.get(index, {})
         if options.get('hidden'):
             return ''
+        if 'show_as' in options:
+            return options['show_as']
         if options.get('ignore_alias_display'):
             return word
         if word.lower() == 'planenoises':
@@ -117,7 +139,7 @@ def format_subtitle_text(cleaned, word_options, normalizer):
             return '*CHHkkk!*'
         return word
 
-    text = re.sub(r'[a-z]+|[,;.!?]', replace, cleaned, flags=re.IGNORECASE)
+    text = re.sub(r'[a-z]+|\d+|[,;.!?]', replace, cleaned, flags=re.IGNORECASE)
     text = re.sub(r'\s+([,;.!?])', r'\1', re.sub(r'\s+', ' ', text)).strip()
     return text
 
@@ -135,6 +157,8 @@ def compatibility_tts_text(text, normalizer):
             continue
         token = tokens[index]
         options = word_options.get(index, {})
+        if options.get('silent'):
+            continue
         if token.isalpha():
             if options.get('custom_phones'):
                 token = ' '.join(PHONE_NAMES.get(phone, phone.lower())
@@ -175,9 +199,10 @@ class RecordedPassages:
                             (video, word.start, word.end)
                         )
                     else:
-                        self.starts.setdefault(token, []).append((video, words, index))
                         self.first_words.setdefault(token, (video, word.start, word.end))
                         self.variants.setdefault(token, []).append((video, word.start, word.end))
+                        if word.phonems:
+                            self.starts.setdefault(token, []).append((video, words, index))
                     for alias in getattr(word, 'mario_aliases', []):
                         alias_words = tuple(re.findall('[a-z]+', alias.lower()))
                         if not alias_words:
@@ -189,11 +214,12 @@ class RecordedPassages:
                             )
                         else:
                             alias_token = alias_words[0]
-                            self.starts.setdefault(alias_token, []).append((video, words, index))
                             self.first_words.setdefault(alias_token, (video, word.start, word.end))
                             self.variants.setdefault(alias_token, []).append(
                                 (video, word.start, word.end)
                             )
+                            if word.phonems:
+                                self.starts.setdefault(alias_token, []).append((video, words, index))
 
     def phones(self, words):
         result = []
@@ -220,6 +246,8 @@ class RecordedPassages:
                     if re.sub('[^a-z]', '', words[last].original_word.lower()) != requested[-1]:
                         continue
                     span = words[first:last + 1]
+                    if any(not word.phonems for word in span):
+                        continue
                     if any(left.end > right.start + 1 / 16000 for left, right in zip(span, span[1:])):
                         continue
                     actual = tuple(re.sub('[^a-z]', '', word.original_word.lower()) for word in span)
@@ -269,11 +297,15 @@ class RecordedPassages:
         self.cache[requested] = result
         return result
 
-    def plan(self, tokens, controls=None, skip_recorded=None, pauses=None):
+    def plan(self, tokens, controls=None, skip_recorded=None, pauses=None, silent_tokens=None,
+             word_options=None):
         skip_recorded = set(skip_recorded or ())
         pauses = pauses or {}
+        silent_tokens = set(silent_tokens or ())
         counters = {}
         pinned = {}
+        all_variants = {}
+        auto_increment = set()
         for index, token in enumerate(tokens):
             if controls and index in controls:
                 operation, amount = controls[index]
@@ -290,12 +322,52 @@ class RecordedPassages:
                     current = value
                 variants = self.variants.get(token, [])
                 counters[token] = current if 0 <= current < len(variants) else 0
-            if token in counters:
-                variants = self.variants.get(token, [])
-                pinned[index] = variants[counters[token]] if variants else None
+            options = (word_options or {}).get(index, {})
+            if options.get('allow_auto_variant_inc'):
+                auto_increment.add(token)
+            variants = self.variants.get(token, [])
+            if (token in counters or token in auto_increment or options.get('play_all_variants')
+                    or 'play_variants_until' in options):
+                current = counters.get(token, 0)
+                if variants:
+                    current %= len(variants)
+                    pinned[index] = variants[current]
+                    if 'play_variants_until' in options:
+                        target = options['play_variants_until'] % len(variants)
+                        selected = []
+                        variant_index = current
+                        for _ in range(len(variants)):
+                            selected.append(variants[variant_index])
+                            if variant_index == target:
+                                break
+                            variant_index = (variant_index + 1) % len(variants)
+                        all_variants[index] = selected
+                    elif options.get('play_all_variants'):
+                        all_variants[index] = variants[current:] + variants[:current]
+                    if token in auto_increment:
+                        counters[token] = (current + 1) % len(variants)
+                else:
+                    pinned[index] = None
         positions = [index for index, token in enumerate(tokens) if token.isalpha()]
         words = [tokens[index] for index in positions]
-        whole = self.match(words) if not pinned and not skip_recorded and not pauses else None
+        simultaneous_groups = {}
+        index = 0
+        while index < len(tokens):
+            if not (word_options or {}).get(index, {}).get('simul') or not tokens[index].isalpha():
+                index += 1
+                continue
+            group = [index]
+            next_index = next((position for position in positions if position > index), None)
+            if next_index is not None:
+                group.append(next_index)
+            while next_index is not None and (word_options or {}).get(next_index, {}).get('simul'):
+                next_index = next((position for position in positions if position > next_index), None)
+                if next_index is None:
+                    break
+                group.append(next_index)
+            simultaneous_groups[index] = group
+            index = group[-1] + 1
+        whole = self.match(words) if not pinned and not skip_recorded and not pauses and not silent_tokens and not simultaneous_groups else None
         if whole is not None:
             return [(tokens, whole)]
         result = []
@@ -309,6 +381,29 @@ class RecordedPassages:
                     pending = []
                 result.append(([f'{PAUSE_TOKEN}{pauses[cursor]}'], None))
                 emitted_pauses.add(cursor)
+            if cursor in simultaneous_groups:
+                if pending:
+                    result.append((pending, None))
+                    pending = []
+                group = simultaneous_groups[cursor]
+                result.append(([tokens[position] for position in group],
+                               (SIMULTANEOUS_TOKEN, group)))
+                cursor = group[-1] + 1
+                continue
+            if cursor in silent_tokens:
+                if pending:
+                    result.append((pending, None))
+                    pending = []
+                result.append(([SILENT_TOKEN], None))
+                cursor += 1
+                continue
+            if cursor in all_variants:
+                if pending:
+                    result.append((pending, None))
+                    pending = []
+                result.append(([tokens[cursor]], (ALL_VARIANTS, all_variants[cursor])))
+                cursor += 1
+                continue
             if cursor in skip_recorded:
                 if pending:
                     result.append((pending, None))
@@ -318,7 +413,8 @@ class RecordedPassages:
                 continue
             found = None
             if tokens[cursor].isalpha():
-                barrier = min((index for index in skip_recorded | set(pauses) if index > cursor), default=len(tokens))
+                barrier = min((index for index in skip_recorded | set(pauses) | silent_tokens
+                               if index > cursor), default=len(tokens))
                 remaining = [index for index in positions if cursor <= index < barrier] if cursor not in pinned else []
                 for count in range(min(len(remaining), self.maximum_words + 2), 1, -1):
                     end = remaining[count - 1] + 1

@@ -1,4 +1,7 @@
+import json
+import os
 import re
+import unicodedata
 from pathlib import Path
 
 
@@ -53,6 +56,10 @@ def guess_pronunciation(word):
 
 
 def load_pronunciations():
+    exported_path = os.environ.get('MARIOASSISTANT_PRONUNCIATIONS_PATH')
+    if exported_path:
+        with Path(exported_path).open(encoding='utf-8') as source:
+            return json.load(source)
     import pocketsphinx
 
     dictionary_path = Path(pocketsphinx.get_model_path()) / 'en-us' / 'cmudict-en-us.dict'
@@ -69,3 +76,81 @@ def load_pronunciations():
             if alias and alias != word:
                 pronunciations.setdefault(alias, []).append(phones)
     return pronunciations
+
+
+def sentence_mix_spanish(text):
+    word_matches = list(re.finditer(r"[^\W\d_]+(?:['’][^\W\d_]+)*", text, re.UNICODE))
+    output = text
+    for match in reversed(word_matches):
+        original = match.group(0)
+        word = original.lower()
+        phones = []
+        index = 0
+        while index < len(word):
+            phone = None
+            pair = word[index:index + 2]
+            if pair == 'ch':
+                phones.append('CH')
+                index += 2
+            elif pair == 'rr':
+                phones.append('R')
+                index += 2
+            elif pair == 'll':
+                phones.append('Y')
+                index += 2
+            elif pair == 'qu':
+                phones.append('K')
+                index += 2
+            elif pair == 'gu' and index + 2 < len(word) and word[index + 2] in 'eiéí':
+                phones.append('G')
+                index += 2
+            elif word[index] == 'h':
+                index += 1
+            elif word[index] == 'ñ':
+                phones.append('N')
+                index += 1
+            elif word[index] in 'aeiouáéíóú':
+                phones.append({'a': 'AA', 'á': 'AA', 'e': 'EH', 'é': 'EH',
+                               'i': 'IY', 'í': 'IY', 'o': 'OW', 'ó': 'OW',
+                               'u': 'UW', 'ú': 'UW'}[word[index]])
+                index += 1
+            else:
+                char = word[index]
+                next_char = word[index + 1:index + 2]
+                phone = {
+                    'b': 'B', 'v': 'B', 'c': 'S' if next_char in 'eiéí' else 'K',
+                    'k': 'K', 'q': 'K', 'd': 'D', 'f': 'F',
+                    'g': 'HH' if next_char in 'eiéí' else 'G',
+                    'j': 'HH', 'l': 'L', 'm': 'M', 'n': 'N', 'p': 'P',
+                    'r': 'R', 's': 'S', 't': 'T', 'w': 'W', 'x': 'K',
+                    'y': 'Y', 'z': 'S',
+                }.get(char)
+                index += 1
+            if phone:
+                phones.append(phone)
+        if not phones:
+            raise RuntimeError(f'Could not convert Spanish pronunciation for {original}')
+        ascii_word = unicodedata.normalize('NFKD', original)
+        ascii_word = ''.join(char for char in ascii_word if not unicodedata.combining(char))
+        ascii_word = re.sub(r'[^A-Za-z]', '', ascii_word)
+        options = ','.join(
+            f'{phone},l={0.105 if phone in {"AA", "EH", "IY", "OW", "UW"} else 0.065}'
+            for phone in phones
+        )
+        replacement = f'\\custompronunphoneme={options}|showas={original}\\{ascii_word}'
+        output = output[:match.start()] + replacement + output[match.end():]
+    return output
+
+
+def is_spanish_text(text):
+    if re.search(r'[áéíóúüñ¿¡]', text, re.IGNORECASE):
+        return True
+    words = set(re.findall(r'[a-z]+', text.casefold()))
+    markers = {
+        'el', 'ella', 'ellos', 'ellas', 'nosotros', 'ustedes', 'que', 'qué',
+        'como', 'cómo', 'para', 'pero', 'porque', 'por', 'una', 'uno', 'unos',
+        'unas', 'con', 'del', 'los', 'las', 'soy', 'eres', 'está', 'esta',
+        'están', 'tengo', 'tiene', 'hola', 'buenos', 'buenas', 'gracias',
+        'noticias', 'comodoro', 'rivadavia',
+    }
+    return len(words & markers) >= 2
