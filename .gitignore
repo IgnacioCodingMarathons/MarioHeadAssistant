@@ -222,4 +222,5 @@ __marimo__/
 # mario running on my end
 logs/
 mario_words.mov
+mario_words.webm
 assets/mario_sentence_mixer.bin.bak
