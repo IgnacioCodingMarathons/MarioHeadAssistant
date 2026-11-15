@@ -1,3 +1,4 @@
+import json
 import math
 import queue
 import random
@@ -36,13 +37,20 @@ def failure_limit(level):
 
 
 def ingredient_deductions(name, points, target, spread, budget, strictness=1):
-    if name == 'Tomato':
-        centers = set(points)
-        covered = sum(any((x - px) ** 2 + (y - py) ** 2 <= SPREAD_RADIUS ** 2 for px, py in centers)
-                      for x, y in SAUCE_SAMPLE_POINTS)
-        coverage = covered / len(SAUCE_SAMPLE_POINTS)
-        desired = min(.95, .75 + .2 * (strictness - 1))
-        yield 'Tomato could cover more of the pizza', round(budget * max(0, desired - coverage))
+    if spread:
+        coverage = sum(
+            any((x - px) ** 2 + (y - py) ** 2 <= SPREAD_RADIUS ** 2 for px, py in points)
+            for x, y in SAUCE_SAMPLE_POINTS
+        ) / len(SAUCE_SAMPLE_POINTS)
+        target_coverage = sum(
+            any((x - px) ** 2 + (y - py) ** 2 <= SPREAD_RADIUS ** 2 for px, py in target)
+            for x, y in SAUCE_SAMPLE_POINTS
+        ) / len(SAUCE_SAMPLE_POINTS)
+        minimum_coverage = target_coverage * (.62 + .05 * max(0, strictness - 1))
+        if coverage < minimum_coverage:
+            yield f'{name} could cover more of the pizza', round(
+                budget * min(1, (minimum_coverage - coverage) / max(minimum_coverage, .01))
+            )
         return
 
     count = len(points)
@@ -111,7 +119,7 @@ def grade_pizza(order_base, order_toppings, base, placements, preview, level=5):
 
 
 def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high_score, save_high_score, speech_busy, prepare_line, play_line,
-                        load_music, start_music, stop_music, start_meal, cancel_meal):
+                        load_music, start_music, stop_music, start_meal, cancel_meal, autosave_path=None):
     from PySide6 import QtGui
 
     class PizzaWindow(QtWidgets.QWidget):
@@ -131,6 +139,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
             preparation_timer.stop()
             cancel_preparation()
             stop_music()
+            persist()
             on_close()
             super().closeEvent(event)
 
@@ -317,7 +326,14 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
     ticket_layout = QtWidgets.QVBoxLayout(ticket_box)
     ticket = QtWidgets.QLabel()
     ticket.setWordWrap(True)
-    ticket_layout.addWidget(ticket)
+    ticket_scroll = QtWidgets.QScrollArea()
+    ticket_scroll.setWidgetResizable(True)
+    ticket_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    ticket_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    ticket_scroll.setWidget(ticket)
+    ticket_scroll.setMinimumHeight(82)
+    ticket_scroll.setMaximumHeight(150)
+    ticket_layout.addWidget(ticket_scroll)
     preview = Pie(preview=True)
     preview.setMinimumSize(145, 145)
     preview.setAccessibleName("Preview of Mario’s pizza")
@@ -468,6 +484,19 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
     next_button = None
     order_base = ()
     order_toppings = set()
+
+    def persist():
+        if autosave_path is None:
+            return
+        try:
+            autosave_path.parent.mkdir(parents=True, exist_ok=True)
+            autosave_path.write_text(json.dumps({
+                'difficulty': difficulty.value(), 'order_base': order_base,
+                'order_toppings': sorted(order_toppings), 'base': base,
+                'placements': placements, 'baked': baked, 'score': result_score,
+            }, separators=(',', ':')), encoding='utf-8')
+        except (OSError, TypeError, ValueError):
+            pass
 
     def show_high_score():
         value = get_high_score()
@@ -633,6 +662,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         show_limit()
         show_high_score()
         music_ready = load_music()
+        persist()
         prepare(f'{TITLE}!', True, announce_intro)
 
     def start_baking():
@@ -693,6 +723,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         view_receipt.setEnabled(True)
         show_receipt()
         show_high_score()
+        persist()
 
     def announce_result():
         nonlocal result_media

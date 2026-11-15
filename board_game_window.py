@@ -7,7 +7,8 @@ def create_board_game_window(
         QtCore, QtWidgets, on_close, title, instructions, initial, draw_board,
         make_move, board_cells=False, legal_moves=None, hit_test=None, marker=None,
         say=None, speech_busy=None, cpu_move=None, preview_move=None,
-        draw_watch_board=None):
+        draw_watch_board=None, autosave_path=None):
+    import json
     from PySide6 import QtGui, QtSvg, QtSvgWidgets
 
     class GameWindow(QtWidgets.QWidget):
@@ -17,6 +18,7 @@ def create_board_game_window(
 
         def closeEvent(self, event):
             timer.stop()
+            persist()
             on_close()
             super().closeEvent(event)
 
@@ -151,6 +153,25 @@ def create_board_game_window(
         entry = current_entry()
         return entry[3] if entry else starting_position
 
+    def persist():
+        if autosave_path is None:
+            return
+        try:
+            autosave_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'title': title,
+                'watch': watch,
+                'cursor': cursor,
+                'starting_position': starting_position,
+                'moves': [
+                    [description, svg, winner, position]
+                    for description, svg, winner, position in moves
+                ],
+            }
+            autosave_path.write_text(json.dumps(payload, default=str, separators=(',', ':')), encoding='utf-8')
+        except (OSError, TypeError, ValueError):
+            pass
+
     def automated():
         return watch or cursor % 2
 
@@ -260,6 +281,7 @@ def create_board_game_window(
         moves.append((watch_text(description), draw_position(position, player, highlight),
                       watch_text(winner) if winner else None, position))
         cursor += 1
+        persist()
         if winner:
             announce_result(winner)
         else:

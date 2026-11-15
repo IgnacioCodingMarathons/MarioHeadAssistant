@@ -97,10 +97,10 @@ def roll_move(position, player, cell):
     return description, tuple(positions), landing, winner
 
 
-def create_snakes_and_ladders_window(QtCore, QtWidgets, on_close, say, speech_busy):
+def create_snakes_and_ladders_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
     return create_board_game_window(
         QtCore, QtWidgets, on_close, TITLE,
         'Reach 100 with an exact roll. Climb the green ladders and slide down the pink snakes.',
         (0, 0), board_svg, roll_move,
-        say=say, speech_busy=speech_busy, draw_watch_board=partial(board_svg, watch=True),
+        say=say, speech_busy=speech_busy, draw_watch_board=partial(board_svg, watch=True), autosave_path=autosave_path,
     )

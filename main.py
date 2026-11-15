@@ -48,6 +48,7 @@ from sentence_mixer_passages import compatibility_tts_text, format_subtitle_text
 from weather_service import WeatherService, weather_failure_message
 from news_service import display_network_name, latest_news
 from pizza_challenge import ACTION as PIZZA_ACTION, TITLE as PIZZA_TITLE, create_pizza_window
+from exploding_blocks import ACTION as EXPLODING_BLOCKS_ACTION, TITLE as EXPLODING_BLOCKS_TITLE, create_exploding_blocks_window
 from backgammon import create_backgammon_window
 from checkers import create_checkers_window
 from chess_game import create_chess_window
@@ -522,7 +523,8 @@ BOARD_GAMES = {
 }
 IM_GAME_TITLES = {'connect4_start': 'Connect-4', **{
     action: title for action, (title, _) in BOARD_GAMES.items()
-}, PIZZA_ACTION: PIZZA_TITLE}
+}, PIZZA_ACTION: PIZZA_TITLE, EXPLODING_BLOCKS_ACTION: EXPLODING_BLOCKS_TITLE}
+SOLO_IM_GAMES = (PIZZA_ACTION, EXPLODING_BLOCKS_ACTION)
 
 
 def create_im_games_window(QtWidgets, menu_action):
@@ -542,10 +544,10 @@ def create_im_games_window(QtWidgets, menu_action):
 
     def watch_selected():
         row = game_list.currentRow()
-        if row >= 0 and game_actions[row] != PIZZA_ACTION:
+        if row >= 0 and game_actions[row] not in SOLO_IM_GAMES:
             menu_action[0] = 'connect4_watch' if row == 0 else f'{game_actions[row]}_watch'
 
-    game_list.currentRowChanged.connect(lambda row: watch_button.setEnabled(row >= 0 and game_actions[row] != PIZZA_ACTION))
+    game_list.currentRowChanged.connect(lambda row: watch_button.setEnabled(row >= 0 and game_actions[row] not in SOLO_IM_GAMES))
     play_button.clicked.connect(play_selected)
     watch_button.clicked.connect(watch_selected)
     layout.addWidget(game_list)
@@ -2661,6 +2663,28 @@ def main() -> None:
         connect4_previous_mixer_enabled = [None]
         connect4_lines_prepared = [False]
 
+        BOARD_GAME_DIALOGUE = tuple(dict.fromkeys((
+            r"\showas=Let's-a\let's \hidden\a go!", 'Your move!', 'Go!',
+            r"\showas=It's-a\it's \hidden\a your turn!", 'Your turn!',
+            'My turn!', r'\showas=Woohoo!\oh \hidden\ho! I won!',
+            "You're great at this game! You win!", "It's a tie! Want to try again?",
+            'You won!', 'Mario won!', 'Luigi wins!', 'Luigi played first.',
+        )))
+
+        def prepare_board_game_dialogue():
+            if not preferences.get("tts_live_sentence_mixing"):
+                return
+            sentence_mixer.set_enabled(True)
+            for line in BOARD_GAME_DIALOGUE:
+                if line in connect4_line_cache:
+                    continue
+                try:
+                    media = sentence_mixer.mix(line, with_video=True, cache=True)
+                    if media is not None:
+                        connect4_line_cache[line] = media
+                except Exception as exc:
+                    print(f"MarioAssistant game dialogue preparation: {exc}", file=sys.stderr)
+
         def cancel_connect4_preparation():
             connect4_prep_generation[0] += 1
             connect4_preparing[0] = None
@@ -3557,10 +3581,12 @@ def main() -> None:
                     Gtk.main_iteration_do(False)
 
                 if skip_requested or menu_action[0] == "stop":
-                    if requested_action["name"] == PIZZA_ACTION:
-                        pizza_window = board_game_windows.get(PIZZA_ACTION)
-                        if pizza_window is not None and pizza_window.isVisible():
-                            pizza_window.close()
+                    game_action = requested_action["name"]
+                    if game_action in SOLO_IM_GAMES:
+                        game_window = board_game_windows.get(game_action)
+                        if game_window is not None and game_window.isVisible():
+                            game_window.close()
+                    if game_action == PIZZA_ACTION:
                         cancel_pizza_meal()
                     proactive_sequence[0] = None
                     if automatic_action_current == 'proactive':
@@ -3702,7 +3728,7 @@ def main() -> None:
                         "hello", "speak", "voice_unrecognized", "voice_apology", "ohsorry",
                         "goodbye", "time_query", "date_query", "weather_query", "wind_query",
                         "volume_query", "eject_cd", "move", "songs", "random_song",
-                        "connect4_start", "connect4_watch", *BOARD_GAMES, PIZZA_ACTION,
+                        "connect4_start", "connect4_watch", *BOARD_GAMES, *SOLO_IM_GAMES,
                     )
                     is_requested_action = (
                         selected_action in requested_action_names
@@ -4206,8 +4232,140 @@ def main() -> None:
                             prepare_pizza_line, play_pizza_line,
                             load_pizza_music, start_pizza_music, stop_pizza_music,
                             start_pizza_meal, cancel_pizza_meal,
+                            save_path.parent / "pizza.win",
                         )
                         board_game_windows[PIZZA_ACTION] = game_window
+                    game_window.reset_game()
+                    game_window.show()
+                    game_window.raise_()
+                    game_window.activateWindow()
+                elif selected_action == EXPLODING_BLOCKS_ACTION:
+                    game_window = board_game_windows.get(EXPLODING_BLOCKS_ACTION)
+                    if game_window is None:
+                        blocks_save_path = save_path.parent / "blocks.win"
+                        legacy_blocks_path = save_path.parent / "explodingblocks.win"
+                        if not blocks_save_path.exists() and legacy_blocks_path.exists():
+                            try:
+                                legacy_blocks_path.replace(blocks_save_path)
+                            except OSError:
+                                pass
+                        def exploding_blocks_closed():
+                            if requested_action.get("name") == EXPLODING_BLOCKS_ACTION:
+                                finish_requested_action()
+
+                        def blocks_high_score():
+                            value = initial_save.get("exploding_blocks_high_score", 0)
+                            return value if type(value) is int and value >= 0 else 0
+
+                        def save_blocks_high_score(score):
+                            write_save_data(save_path, {"exploding_blocks_high_score": score})
+                            initial_save["exploding_blocks_high_score"] = score
+
+                        blocks_music_loaded = False
+                        blocks_speech_process = None
+                        blocks_line_cache = {}
+
+                        def say_blocks_line(line):
+                            nonlocal blocks_speech_process
+                            media = blocks_line_cache.get(line)
+                            if preferences["tts_live_sentence_mixing"] and media is not None:
+                                source_video = Path(media["video"])
+                                try:
+                                    playback_video = Path(temp_dir.name) / (
+                                        f"exploding-blocks-{sentence_mix_generation[0] + 1}{source_video.suffix}"
+                                    )
+                                    shutil.copyfile(source_video, playback_video)
+                                except OSError as error:
+                                    blocks_line_cache.pop(line, None)
+                                    print(f"MarioAssistant Exploding Blocks: rebuilding dialogue: {error}", file=sys.stderr)
+                                else:
+                                    blocks_speech_process = None
+                                    sentence_mix_generation[0] += 1
+                                    requested_action["waiting"] = True
+                                    requested_action["deadline"] = None
+                                    playback_media = dict(media, video=playback_video)
+                                    sentence_mix_results.put((sentence_mix_generation[0], playback_media))
+                                    return
+                            result = speak_mario_text(line, track_process=True)
+                            blocks_speech_process = result if isinstance(result, subprocess.Popen) else None
+
+                        def blocks_speech_busy():
+                            return (blocks_speech_process is not None and blocks_speech_process.poll() is None) or game_speech_busy()
+
+                        def prepare_blocks_game(lines):
+                            nonlocal blocks_music_loaded
+                            stop_song_playback()
+                            results = queue.Queue()
+                            cancelled = threading.Event()
+                            try:
+                                pygame.mixer.music.load(str(ASSETS / "SELECT.MID"))
+                                blocks_music_loaded = True
+                            except (pygame.error, OSError) as error:
+                                print(f"MarioAssistant Exploding Blocks: {error}", file=sys.stderr)
+                            mixing = preferences["tts_live_sentence_mixing"]
+
+                            def prepare():
+                                total = len(lines) + 1 if mixing else 1
+                                results.put((1, total, "Preparing Mario's dialogue…"))
+                                if mixing:
+                                    for index, line in enumerate(lines, 2):
+                                        if cancelled.is_set():
+                                            return
+                                        try:
+                                            media = sentence_mixer.mix(line, with_video=True, cache=True)
+                                            if media is not None:
+                                                blocks_line_cache[line] = media
+                                        except Exception as error:
+                                            print(f"MarioAssistant Exploding Blocks: {error}", file=sys.stderr)
+                                        results.put((index, total, f"Preparing dialogue {index - 1}/{len(lines)}…"))
+
+                            threading.Thread(target=prepare, daemon=True).start()
+                            return results, cancelled
+
+                        def start_blocks_music():
+                            if not blocks_music_loaded:
+                                return
+                            try:
+                                pygame.mixer.music.set_volume(MARIO_VOLUME * .45)
+                                pygame.mixer.music.play(-1)
+                            except (pygame.error, OSError) as error:
+                                print(f"MarioAssistant Exploding Blocks: {error}", file=sys.stderr)
+
+                        def stop_blocks_music(fade):
+                            nonlocal blocks_music_loaded
+                            if blocks_music_loaded:
+                                if fade:
+                                    pygame.mixer.music.fadeout(750)
+                                else:
+                                    pygame.mixer.music.stop()
+                                blocks_music_loaded = False
+
+                        def award_blocks_coins(amount):
+                            nonlocal mariocoins, last_pet_save
+                            if amount <= 0:
+                                return lambda: False
+                            previous = mariocoins
+                            mariocoins += amount
+                            live_values["mariocoins"] = mariocoins
+                            write_save_data(save_path, {"mariocoins": mariocoins, **pet.snapshot()})
+                            last_pet_save = time.monotonic()
+                            eating_channel.play(kaching_sound)
+                            show_coin_change(QtCore, QtWidgets, previous, mariocoins)
+                            if debug_update is not None:
+                                debug_update("mariocoins")
+                            return eating_channel.get_busy
+
+                        game_window = create_exploding_blocks_window(
+                            QtCore, QtWidgets, exploding_blocks_closed,
+                            lambda: play_task_complete_sound(QtWidgets),
+                            say_blocks_line, blocks_speech_busy,
+                            start_blocks_music, stop_blocks_music,
+                            prepare_blocks_game,
+                            award_blocks_coins,
+                            blocks_save_path,
+                            blocks_high_score, save_blocks_high_score,
+                        )
+                        board_game_windows[EXPLODING_BLOCKS_ACTION] = game_window
                     game_window.reset_game()
                     game_window.show()
                     game_window.raise_()
@@ -4222,7 +4380,15 @@ def main() -> None:
                         title, factory = BOARD_GAMES[selected_action]
                         try:
                             game_window = factory(
-                                QtCore, QtWidgets, game_closed, speak_connect4_text, game_speech_busy
+                                QtCore, QtWidgets, game_closed, speak_connect4_text, game_speech_busy,
+                                autosave_path=save_path.parent / {
+                                    'snakes_and_ladders': 'snakes.win',
+                                    'tic_tac_toe': 'tic.win',
+                                    'backgammon': 'gammon.win',
+                                    'checkers': 'check.win',
+                                    'chess': 'chess.win',
+                                    'go': 'go.win',
+                                }[selected_action],
                             )
                         except ModuleNotFoundError as exc:
                             if selected_action != "chess" or exc.name != "chess":
@@ -4235,6 +4401,7 @@ def main() -> None:
                             continue
                         board_game_windows[selected_action] = game_window
                     requested_action["waiting"] = False
+                    prepare_board_game_dialogue()
                     game_window.reset_game(watch_mode=watch_board_game)
                     game_window.show()
                     game_window.raise_()
@@ -4264,7 +4431,7 @@ def main() -> None:
                         connect4_window = create_connect_four_history_window(
                             QtCore, QtWidgets, speak_connect4_text,
                             connect4_finished, connect4_turn_requested, connect4_closed,
-                            connect4_continue,
+                            connect4_continue, save_path.parent / "connect.win",
                         )
                     connect4_window.show()
                     connect4_window.raise_()
@@ -5570,7 +5737,7 @@ def main() -> None:
                                 action_complete = False
                             elif stage == 'after':
                                 news_sequence[0] = None
-                    if (action_complete and requested_action["name"] not in ("goodbye", "connect4", PIZZA_ACTION)
+                    if (action_complete and requested_action["name"] not in ("goodbye", "connect4", *SOLO_IM_GAMES)
                             and requested_action["name"] not in BOARD_GAMES
                             and news_sequence[0] is None):
                         completed_action = requested_action['name']

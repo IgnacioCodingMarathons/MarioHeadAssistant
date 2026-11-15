@@ -1,3 +1,4 @@
+import json
 import random
 from game_difficulty import add_difficulty_slider
 from game_history import write_move_history
@@ -19,12 +20,14 @@ CONNECT_FOUR_DIALOGUE = tuple(dict.fromkeys((
 )))
 
 def create_connect_four_window(
-        QtCore, QtWidgets, say, on_result, on_turn, on_close, on_continue=None):
+        QtCore, QtWidgets, say, on_result, on_turn, on_close, on_continue=None,
+        autosave_path=None):
     from PySide6 import QtGui, QtSvg
 
     class ConnectFourWindow(QtWidgets.QWidget):
         def closeEvent(self, event):
             luigi_timer.stop()
+            persist()
             on_close()
             super().closeEvent(event)
 
@@ -345,6 +348,19 @@ def create_connect_four_window(
         last_move[0] = (row, column)
         winning_cells[0] = move_wins
         move_count[0] = cursor[0]
+        persist()
+
+    def persist():
+        if autosave_path is None:
+            return
+        try:
+            autosave_path.parent.mkdir(parents=True, exist_ok=True)
+            autosave_path.write_text(json.dumps({
+                'watch': watch_mode[0], 'board': board, 'current_turn': current_turn[0],
+                'history': history, 'cursor': cursor[0],
+            }, default=list, separators=(',', ':')), encoding='utf-8')
+        except (OSError, TypeError, ValueError):
+            pass
 
     def announce_player_turn():
         line = CONNECT_FOUR_PLAYER_TURN_LINES[
@@ -538,6 +554,7 @@ def create_connect_four_window(
         winning_cells[0] = set()
         winner_player[0] = None
         move_count[0] = 0
+        persist()
         refresh_board()
         status.setText('Mario and Luigi are ready' if watch_mode[0] else 'Mario is ready')
         set_columns_enabled(False)

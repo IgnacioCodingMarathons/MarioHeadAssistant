@@ -146,12 +146,12 @@ def draw(state, player=None, last=None):
     return ''.join(parts) + '</svg>'
 
 
-def create_go_window(QtCore, QtWidgets, on_close, say, speech_busy):
+def create_go_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
     board = (0,) * len(POINTS)
     return create_board_game_window(
         QtCore, QtWidgets, on_close, 'Go',
         'Click an intersection to place a black stone. Two passes end the game. Area scoring counts stones as played, with 7.5 komi for White.',
         (board, frozenset({board}), 0), draw, move, legal_moves=choices, hit_test=hit_test,
         cpu_move=lambda state, player, level: cpu_action(state, player + 1, level),
-        say=say, speech_busy=speech_busy,
+        say=say, speech_busy=speech_busy, autosave_path=autosave_path,
     )
