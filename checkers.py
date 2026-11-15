@@ -114,7 +114,7 @@ def draw(state, player=None, last=()):
     return ''.join(parts) + '</svg>'
 
 
-def create_checkers_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
+def create_checkers_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None, player_specs=None):
     board = tuple((-1 if row < 3 else 1 if row > 4 else 0) if (row + col) % 2 else 0
                   for row in range(8) for col in range(8))
     return create_board_game_window(
@@ -123,5 +123,5 @@ def create_checkers_window(QtCore, QtWidgets, on_close, say, speech_busy, autosa
         (board, ((board, 1),), 0), draw, move, legal_moves=choices,
         hit_test=lambda x, y: int(y // 60) * 8 + int(x // 60),
         marker=lambda cell: (cell % 8 * 60 + 30, cell // 8 * 60 + 30),
-        say=say, speech_busy=speech_busy, cpu_move=cpu_move, autosave_path=autosave_path,
+        say=say, speech_busy=speech_busy, cpu_move=cpu_move, autosave_path=autosave_path, player_specs=player_specs,
     )

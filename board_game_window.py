@@ -7,8 +7,10 @@ def create_board_game_window(
         QtCore, QtWidgets, on_close, title, instructions, initial, draw_board,
         make_move, board_cells=False, legal_moves=None, hit_test=None, marker=None,
         say=None, speech_busy=None, cpu_move=None, preview_move=None,
-        draw_watch_board=None, autosave_path=None):
+        draw_watch_board=None, autosave_path=None, player_specs=None):
     import json
+    import pickle
+    import zlib
     from PySide6 import QtGui, QtSvg, QtSvgWidgets
 
     class GameWindow(QtWidgets.QWidget):
@@ -17,8 +19,11 @@ def create_board_game_window(
             super().hideEvent(event)
 
         def closeEvent(self, event):
+            nonlocal restored
             timer.stop()
-            persist()
+            if not completed:
+                persist()
+            restored = False
             on_close()
             super().closeEvent(event)
 
@@ -122,6 +127,9 @@ def create_board_game_window(
     draw_position = draw_board
     prefix = ()
     routes = []
+    restored = False
+    completed = False
+    save_magic = b'MARIOBOARD1'
     pending_line = None
     after_line = None
 
@@ -164,16 +172,53 @@ def create_board_game_window(
                 'cursor': cursor,
                 'starting_position': starting_position,
                 'moves': [
-                    [description, svg, winner, position]
-                    for description, svg, winner, position in moves
+                    [description, winner, position]
+                    for description, _, winner, position in moves
                 ],
             }
-            autosave_path.write_text(json.dumps(payload, default=str, separators=(',', ':')), encoding='utf-8')
-        except (OSError, TypeError, ValueError):
+            autosave_path.write_bytes(save_magic + zlib.compress(pickle.dumps(payload, protocol=5), 9))
+        except (OSError, TypeError, ValueError, pickle.PickleError):
             pass
 
+    def clear_autosave():
+        if autosave_path is not None:
+            try:
+                autosave_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def restore_autosave():
+        if autosave_path is None or not autosave_path.exists():
+            return False
+        try:
+            data = autosave_path.read_bytes()
+            if data.startswith(save_magic):
+                payload = pickle.loads(zlib.decompress(data[len(save_magic):]))
+            else:
+                payload = json.loads(data.decode('utf-8'))
+            nonlocal cursor, starting_position, watch, draw_position
+            watch = bool(payload.get('watch', False))
+            starting_position = payload['starting_position']
+            draw_position = draw_watch_board if watch and draw_watch_board else draw_board
+            moves.clear()
+            for entry in payload.get('moves', ()):
+                if len(entry) == 4:
+                    description, _, winner, position = entry
+                else:
+                    description, winner, position = entry
+                moves.append((description, draw_position(position), winner, position))
+            cursor = min(int(payload.get('cursor', len(moves))), len(moves))
+            persist()
+            return True
+        except (OSError, EOFError, ValueError, TypeError, KeyError, UnicodeError, pickle.PickleError, zlib.error):
+            return False
+
     def automated():
-        return watch or cursor % 2
+        if watch:
+            return True
+        if player_specs and cursor % 2 < len(player_specs):
+            return player_specs[cursor % 2].get('kind') == 'cpu'
+        return bool(cursor % 2)
 
     def watch_text(value):
         if watch and value.startswith('You'):
@@ -267,7 +312,7 @@ def create_board_game_window(
         proceed.setEnabled(not locked)
 
     def play(action=None):
-        nonlocal cursor
+        nonlocal cursor, completed
         timer.stop()
         position = current_position()
         player = cursor % 2
@@ -283,7 +328,9 @@ def create_board_game_window(
         cursor += 1
         persist()
         if winner:
+            completed = True
             announce_result(winner)
+            clear_autosave()
         else:
             announce_turn()
         sync()
@@ -351,7 +398,28 @@ def create_board_game_window(
         sync()
 
     def reset(watch_mode=None):
-        nonlocal cursor, starting_position, watch, pending_line, after_line, draw_position
+        nonlocal cursor, starting_position, watch, pending_line, after_line, draw_position, restored, completed
+        if not restored and restore_autosave():
+            restored = True
+            pending_line = after_line = None
+            window.setWindowTitle(f'{title} · Mario vs. Luigi' if watch else title)
+            help_label.setText('Luigi plays the first side. Mario plays the second.' if watch else instructions)
+            def ask_resume():
+                buttons = QtWidgets.QMessageBox.StandardButton
+                answer = QtWidgets.QMessageBox.question(
+                    window, 'Hey!', 'You have an autosave available! Do you want to continue?',
+                    buttons.Yes | buttons.No, buttons.Yes
+                )
+                if answer == buttons.No:
+                    clear_autosave()
+                    reset(watch_mode)
+                    return
+                sync()
+                controls_ready()
+            speak('You have an autosave available! Do you want to continue?', ask_resume)
+            return
+        restored = True
+        completed = False
         if watch_mode is not None:
             watch = watch_mode
         draw_position = draw_watch_board if watch and draw_watch_board else draw_board

@@ -405,6 +405,9 @@ def create_context_menu(Gtk, menu_action, stop_only=False):
         ("Mario's voice command list", "commands"),
         ("Hello", "hello"),
         ("Make me say anything!", "say_anything"),
+        ("Weather", "weather_query"),
+        ("Wind", "wind_query"),
+        ("News", "news_menu"),
         ("Play a song!", "songs"),
         ("Stop music", "stop_music"),
         ("Goodbye", "goodbye"),
@@ -424,8 +427,8 @@ def create_home_window(QtCore, QtGui, QtWidgets, menu_action):
     window = QtWidgets.QWidget()
     window.setWindowTitle("It's-a me, Mario!")
     window.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
-    window.resize(750, 300)
-    window.setMinimumSize(600, 220)
+    window.resize(750, 420)
+    window.setMinimumSize(600, 320)
     layout = QtWidgets.QVBoxLayout(window)
     scroll = QtWidgets.QScrollArea()
     scroll.setWidgetResizable(True)
@@ -445,6 +448,10 @@ def create_home_window(QtCore, QtGui, QtWidgets, menu_action):
         ("Quench thirst", "quench_thirst", "quench.png"),
         ("Voice command list", "commands", "voicelist.png"),
         ("Hello", "hello", "hello.png"),
+        ("Make me say anything!", "say_anything", "quench.png"),
+        ("Weather", "weather_query", "quench.png"),
+        ("Wind", "wind_query", "quench.png"),
+        ("News", "news_menu", "quench.png"),
         ("Goodbye", "goodbye", "goodbye.png"),
     )
     for index, (label, action, image_name) in enumerate(buttons):
@@ -527,7 +534,7 @@ IM_GAME_TITLES = {'connect4_start': 'Connect-4', **{
 SOLO_IM_GAMES = (PIZZA_ACTION, EXPLODING_BLOCKS_ACTION)
 
 
-def create_im_games_window(QtWidgets, menu_action):
+def create_im_games_window(QtWidgets, menu_action, multiplayer_config):
     window = QtWidgets.QWidget()
     window.setWindowTitle('Interactive Mario Games')
     window.setMinimumSize(360, 240)
@@ -538,6 +545,34 @@ def create_im_games_window(QtWidgets, menu_action):
     game_list.setCurrentRow(0)
     play_button = QtWidgets.QPushButton('Play!')
     watch_button = QtWidgets.QPushButton('Watch Mode')
+    multiplayer_button = QtWidgets.QPushButton('Multiplayer Setup')
+
+    def configure_multiplayer():
+        dialog = QtWidgets.QDialog(window)
+        dialog.setWindowTitle('Multiplayer Setup')
+        layout = QtWidgets.QFormLayout(dialog)
+        mode = QtWidgets.QCheckBox('Enable Multiplayer Mode')
+        mode.setChecked(multiplayer_config.get('enabled', False))
+        layout.addRow(mode)
+        role = QtWidgets.QComboBox()
+        role.addItems(('Human', 'CPU'))
+        role.setCurrentIndex(0 if multiplayer_config.get('player2_human', False) else 1)
+        layout.addRow('Player 2', role)
+        character = QtWidgets.QComboBox()
+        character.addItems(('Mario', 'Luigi', 'Peach', 'Bowser', 'Bowser Jr.', 'Toad'))
+        character.setCurrentText(multiplayer_config.get('character', 'Mario'))
+        layout.addRow('CPU character', character)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            multiplayer_config['enabled'] = mode.isChecked()
+            multiplayer_config['player2_human'] = role.currentIndex() == 0
+            multiplayer_config['character'] = character.currentText()
     def play_selected():
         if game_list.currentRow() >= 0:
             menu_action[0] = game_actions[game_list.currentRow()]
@@ -550,9 +585,11 @@ def create_im_games_window(QtWidgets, menu_action):
     game_list.currentRowChanged.connect(lambda row: watch_button.setEnabled(row >= 0 and game_actions[row] not in SOLO_IM_GAMES))
     play_button.clicked.connect(play_selected)
     watch_button.clicked.connect(watch_selected)
+    multiplayer_button.clicked.connect(configure_multiplayer)
     layout.addWidget(game_list)
     layout.addWidget(play_button)
     layout.addWidget(watch_button)
+    layout.addWidget(multiplayer_button)
     return window
 
 
@@ -1341,6 +1378,9 @@ def show_context_menu(Gtk, Gdk, menu_action, active_menu, stop_only=False):
             ("Mario's voice command list", "commands"),
             ("Hello", "hello"),
             ("Make me say anything!", "say_anything"),
+            ("Weather", "weather_query"),
+            ("Wind", "wind_query"),
+            ("News", "news_menu"),
             ("Play a song!", "songs"),
             ("Stop music", "stop_music"),
             ("Goodbye", "goodbye"),
@@ -1410,6 +1450,9 @@ def create_tray_menu(QtWidgets, tray, menu_action, live_values):
         ("Mario's voice command list", "commands"),
         ("Hello", "hello"),
         ("Make me say anything!", "say_anything"),
+        ("Weather", "weather_query"),
+        ("Wind", "wind_query"),
+        ("News", "news_menu"),
         ("Play a song!", "songs"),
         ("Stop music", "stop_music"),
         ("Goodbye", "goodbye"),
@@ -2653,6 +2696,11 @@ def main() -> None:
         im_games_window = None
         connect4_window = None
         board_game_windows = {}
+        multiplayer_config = {
+            'enabled': False,
+            'player2_human': False,
+            'character': 'Mario',
+        }
         connect4_result = [None]
         connect4_continue_requested = [False]
         connect4_turn_event = [None]
@@ -3724,10 +3772,47 @@ def main() -> None:
                     if voice_request_active:
                         finish_voice_request()
                 elif selected_action is not None and not requested_action["active"]:
+                    if selected_action == "news_menu":
+                        dialog = QtWidgets.QDialog()
+                        dialog.setWindowTitle("THE NEWWWWSSSWSSSS??!?!?!")
+                        dialog.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+                        dialog_layout = QtWidgets.QVBoxLayout(dialog)
+                        dialog_layout.addWidget(QtWidgets.QLabel(
+                            "Type in the news network you want to hear from."
+                        ))
+                        network_input = QtWidgets.QLineEdit()
+                        network_input.setPlaceholderText("News network")
+                        dialog_layout.addWidget(network_input)
+                        location_check = QtWidgets.QCheckBox("From my location")
+                        dialog_layout.addWidget(location_check)
+                        format_check = QtWidgets.QCheckBox("Specific format")
+                        dialog_layout.addWidget(format_check)
+                        format_combo = QtWidgets.QComboBox()
+                        format_combo.addItems(("Audio", "Text"))
+                        format_combo.setEnabled(False)
+                        dialog_layout.addWidget(format_combo)
+                        dialog_buttons = QtWidgets.QDialogButtonBox(
+                            QtWidgets.QDialogButtonBox.StandardButton.Ok
+                            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+                        )
+                        dialog_layout.addWidget(dialog_buttons)
+                        location_check.toggled.connect(network_input.setDisabled)
+                        format_check.toggled.connect(format_combo.setEnabled)
+                        dialog_buttons.accepted.connect(dialog.accept)
+                        dialog_buttons.rejected.connect(dialog.reject)
+                        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                            network = "my current location" if location_check.isChecked() else network_input.text().strip()
+                            if network:
+                                mode = format_combo.currentText().lower() if format_check.isChecked() else "auto"
+                                selected_action = f"news_query:{mode}:{network}"
+                            else:
+                                selected_action = None
+                        else:
+                            selected_action = None
                     requested_action_names = (
                         "hello", "speak", "voice_unrecognized", "voice_apology", "ohsorry",
                         "goodbye", "time_query", "date_query", "weather_query", "wind_query",
-                        "volume_query", "eject_cd", "move", "songs", "random_song",
+                        "volume_query", "eject_cd", "move", "songs", "random_song", "news_menu",
                         "connect4_start", "connect4_watch", *BOARD_GAMES, *SOLO_IM_GAMES,
                     )
                     is_requested_action = (
@@ -4132,7 +4217,7 @@ def main() -> None:
                 elif selected_action == "im_games":
                     if im_games_window is None:
                         im_games_window = create_im_games_window(
-                            QtWidgets, menu_action
+                            QtWidgets, menu_action, multiplayer_config
                         )
                     im_games_window.show()
                     im_games_window.raise_()
@@ -4235,10 +4320,10 @@ def main() -> None:
                             save_path.parent / "pizza.win",
                         )
                         board_game_windows[PIZZA_ACTION] = game_window
-                    game_window.reset_game()
                     game_window.show()
                     game_window.raise_()
                     game_window.activateWindow()
+                    game_window.reset_game()
                 elif selected_action == EXPLODING_BLOCKS_ACTION:
                     game_window = board_game_windows.get(EXPLODING_BLOCKS_ACTION)
                     if game_window is None:
@@ -4366,10 +4451,10 @@ def main() -> None:
                             blocks_high_score, save_blocks_high_score,
                         )
                         board_game_windows[EXPLODING_BLOCKS_ACTION] = game_window
-                    game_window.reset_game()
                     game_window.show()
                     game_window.raise_()
                     game_window.activateWindow()
+                    game_window.reset_game()
                 elif selected_action in BOARD_GAMES:
                     game_window = board_game_windows.get(selected_action)
                     if game_window is None:
@@ -4389,6 +4474,13 @@ def main() -> None:
                                     'chess': 'chess.win',
                                     'go': 'go.win',
                                 }[selected_action],
+                                player_specs=(
+                                    ({'kind': 'human', 'name': 'You'},
+                                     {'kind': 'human', 'name': 'Player 2'})
+                                    if multiplayer_config.get('enabled') and multiplayer_config.get('player2_human')
+                                    else ({'kind': 'human', 'name': 'You'},
+                                          {'kind': 'cpu', 'name': multiplayer_config.get('character', 'Mario')})
+                                ),
                             )
                         except ModuleNotFoundError as exc:
                             if selected_action != "chess" or exc.name != "chess":
@@ -4402,10 +4494,10 @@ def main() -> None:
                         board_game_windows[selected_action] = game_window
                     requested_action["waiting"] = False
                     prepare_board_game_dialogue()
-                    game_window.reset_game(watch_mode=watch_board_game)
                     game_window.show()
                     game_window.raise_()
                     game_window.activateWindow()
+                    game_window.reset_game(watch_mode=watch_board_game)
                 elif selected_action in ("connect4_start", "connect4_watch"):
                     connect4_result[0] = None
                     sentence_mix_generation[0] += 1
@@ -4432,6 +4524,13 @@ def main() -> None:
                             QtCore, QtWidgets, speak_connect4_text,
                             connect4_finished, connect4_turn_requested, connect4_closed,
                             connect4_continue, save_path.parent / "connect.win",
+                            player_specs=(
+                                ({'kind': 'human', 'name': 'You'},
+                                 {'kind': 'human', 'name': 'Player 2'})
+                                if multiplayer_config.get('enabled') and multiplayer_config.get('player2_human')
+                                else ({'kind': 'human', 'name': 'You'},
+                                      {'kind': 'cpu', 'name': multiplayer_config.get('character', 'Mario')})
+                            ),
                         )
                     connect4_window.show()
                     connect4_window.raise_()

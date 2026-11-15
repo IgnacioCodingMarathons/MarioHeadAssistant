@@ -184,11 +184,11 @@ def draw(state, player=None, last=()):
     return ''.join(parts) + '</svg>'
 
 
-def create_backgammon_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
+def create_backgammon_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None, player_specs=None):
     return create_board_game_window(
         QtCore, QtWidgets, on_close, 'Backgammon',
         'You play cream toward point 1. Click a checker’s point, then its destination. Repeat for the remaining dice. Click Bear off when eligible.',
         initial, draw, move, legal_moves=choices, hit_test=hit_test, marker=marker, preview_move=preview,
         cpu_move=best_turn,
-        say=say, speech_busy=speech_busy, autosave_path=autosave_path,
+        say=say, speech_busy=speech_busy, autosave_path=autosave_path, player_specs=player_specs,
     )

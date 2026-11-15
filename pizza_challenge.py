@@ -1,7 +1,9 @@
-import json
 import math
+import json
+import pickle
 import queue
 import random
+import zlib
 from html import escape
 from pathlib import Path
 
@@ -139,7 +141,9 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
             preparation_timer.stop()
             cancel_preparation()
             stop_music()
-            persist()
+            if not served[0]:
+                persist()
+            restored[0] = False
             on_close()
             super().closeEvent(event)
 
@@ -330,6 +334,11 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
     ticket_scroll.setWidgetResizable(True)
     ticket_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     ticket_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    ticket_scroll.setStyleSheet(
+        'QScrollArea { background: #f7ead6; border: none; } '
+        'QScrollArea > QWidget > QWidget { background: #f7ead6; }'
+    )
+    ticket.setStyleSheet('background: #f7ead6; color: #39251e;')
     ticket_scroll.setWidget(ticket)
     ticket_scroll.setMinimumHeight(82)
     ticket_scroll.setMaximumHeight(150)
@@ -484,19 +493,53 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
     next_button = None
     order_base = ()
     order_toppings = set()
+    save_magic = b'MARIOPIZZA1'
+    restored = [False]
+    served = [False]
 
     def persist():
         if autosave_path is None:
             return
         try:
             autosave_path.parent.mkdir(parents=True, exist_ok=True)
-            autosave_path.write_text(json.dumps({
+            payload = {
                 'difficulty': difficulty.value(), 'order_base': order_base,
                 'order_toppings': sorted(order_toppings), 'base': base,
                 'placements': placements, 'baked': baked, 'score': result_score,
-            }, separators=(',', ':')), encoding='utf-8')
-        except (OSError, TypeError, ValueError):
+            }
+            autosave_path.write_bytes(save_magic + zlib.compress(pickle.dumps(payload, protocol=5), 9))
+        except (OSError, TypeError, ValueError, pickle.PickleError):
             pass
+
+    def clear_autosave():
+        if autosave_path is not None:
+            try:
+                autosave_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def restore_autosave():
+        nonlocal order_base, order_toppings, baked, result_score
+        if autosave_path is None or not autosave_path.exists():
+            return False
+        try:
+            data = autosave_path.read_bytes()
+            if data.startswith(save_magic):
+                payload = pickle.loads(zlib.decompress(data[len(save_magic):]))
+            else:
+                payload = json.loads(data.decode('utf-8'))
+            order_base = tuple(payload['order_base'])
+            order_toppings = set(payload['order_toppings'])
+            base[:] = list(payload.get('base', base))
+            placements.clear()
+            placements.update(payload.get('placements', {}))
+            baked = bool(payload.get('baked', False))
+            result_score = int(payload.get('score', 0))
+            difficulty.setValue(int(payload.get('difficulty', difficulty.value())))
+            persist()
+            return True
+        except (OSError, EOFError, ValueError, TypeError, KeyError, UnicodeError, pickle.PickleError, zlib.error):
+            return False
 
     def show_high_score():
         value = get_high_score()
@@ -513,7 +556,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         show_high_score()
 
     def feedback_html():
-        html = ['<p>Starting score: 45 points</p>']
+        html = [f'<p>Score: {result_score} points</p>']
         for heading, positive in (('What Mario liked', True), ("What Mario didn't like", False)):
             rows = [f'<li>{escape(reason)} <strong>{points:+d} points</strong></li>'
                     for reason, points in result_feedback if (points > 0) == positive]
@@ -628,8 +671,12 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         cancel_meal()
         cancel_preparation()
         stop_music()
-        order_base = tuple(random.choice(options) for _, options in CATEGORIES)
-        order_toppings = set(random.sample(TOPPINGS, random.randint(2, 4)))
+        loaded = not restored[0] and restore_autosave()
+        restored[0] = True
+        served[0] = False
+        if not loaded:
+            order_base = tuple(random.choice(options) for _, options in CATEGORIES)
+            order_toppings = set(random.sample(TOPPINGS, random.randint(2, 4)))
         order_preview.clear()
         order_preview.update(sample_order(order_base, order_toppings))
         preview.update()
@@ -637,9 +684,10 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         lines.extend(('', 'Toppings:', *[name for name in TOPPINGS if name in order_toppings]))
         ticket.setText('\n'.join(lines))
         oven_timer.stop()
-        baked = False
-        base[:] = [None] * len(CATEGORIES)
-        placements.clear()
+        if not loaded:
+            baked = False
+            base[:] = [None] * len(CATEGORIES)
+            placements.clear()
         select_ingredient(None)
         for button in ingredient_buttons:
             group = button.group()
@@ -652,7 +700,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         station.setEnabled(False)
         bake.setEnabled(False)
         pie.update()
-        submit.setEnabled(False)
+        submit.setEnabled(bool(baked))
         difficulty.setEnabled(True)
         another.setEnabled(False)
         view_receipt.setEnabled(False)
@@ -661,6 +709,28 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         result_label.setText('Loading pizza challenge…')
         show_limit()
         show_high_score()
+        if loaded:
+            music_ready = load_music()
+            station.setEnabled(not baked)
+            bake.setEnabled(not baked)
+            def ask_resume():
+                buttons = QtWidgets.QMessageBox.StandardButton
+                answer = QtWidgets.QMessageBox.question(
+                    window, 'Hey!', 'You have an autosave available! Do you want to continue?',
+                    buttons.Yes | buttons.No, buttons.Yes
+                )
+                if answer == buttons.No:
+                    clear_autosave()
+                    restored[0] = True
+                    reset()
+                    return
+                if music_ready and not baked:
+                    start_music()
+                station.setEnabled(not baked)
+                bake.setEnabled(not baked)
+            say('You have an autosave available! Do you want to continue?')
+            QtCore.QTimer.singleShot(1200, ask_resume)
+            return
         music_ready = load_music()
         persist()
         prepare(f'{TITLE}!', True, announce_intro)
@@ -709,6 +779,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         submit.setEnabled(True)
 
     def serve():
+        served[0] = True
         submit.setEnabled(False)
         stop_music()
         start_meal(tip_cents, announce_result)
@@ -723,7 +794,7 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
         view_receipt.setEnabled(True)
         show_receipt()
         show_high_score()
-        persist()
+        clear_autosave()
 
     def announce_result():
         nonlocal result_media

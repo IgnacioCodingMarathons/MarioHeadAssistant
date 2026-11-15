@@ -1,5 +1,7 @@
 import json
+import pickle
 import random
+import zlib
 from game_difficulty import add_difficulty_slider
 from game_history import write_move_history
 
@@ -21,13 +23,15 @@ CONNECT_FOUR_DIALOGUE = tuple(dict.fromkeys((
 
 def create_connect_four_window(
         QtCore, QtWidgets, say, on_result, on_turn, on_close, on_continue=None,
-        autosave_path=None):
+        autosave_path=None, player_specs=None):
     from PySide6 import QtGui, QtSvg
 
     class ConnectFourWindow(QtWidgets.QWidget):
         def closeEvent(self, event):
             luigi_timer.stop()
-            persist()
+            if not completed[0]:
+                persist()
+            restored[0] = False
             on_close()
             super().closeEvent(event)
 
@@ -87,6 +91,9 @@ def create_connect_four_window(
     winning_cells = [set()]
     winner_player = [None]
     move_count = [0]
+    completed = [False]
+    restored = [False]
+    save_magic = b'MARIOCONNECT1'
     player_turn_line_index = [0]
     luigi_timer = QtCore.QTimer(window)
     luigi_timer.setSingleShot(True)
@@ -99,7 +106,16 @@ def create_connect_four_window(
     def player_name(player):
         if watch_mode[0]:
             return 'Luigi' if player == 1 else 'Mario'
+        if player_specs and player - 1 < len(player_specs):
+            return player_specs[player - 1].get('name', 'Player 2' if player == 2 else 'You')
         return 'You' if player == 1 else 'Mario'
+
+    def player_is_cpu(player):
+        if watch_mode[0]:
+            return True
+        if player_specs and player - 1 < len(player_specs):
+            return player_specs[player - 1].get('kind') == 'cpu'
+        return player == 2
 
     def find_winning_cells(current, player):
         for row in range(6):
@@ -304,6 +320,8 @@ def create_connect_four_window(
             button.setEnabled(enabled and board[0][index % 7] == 0)
 
     def finish_round(player_won):
+        completed[0] = True
+        clear_autosave()
         active[0] = False
         set_columns_enabled(False)
         if watch_mode[0] and player_won in ('mario', 'luigi'):
@@ -355,12 +373,44 @@ def create_connect_four_window(
             return
         try:
             autosave_path.parent.mkdir(parents=True, exist_ok=True)
-            autosave_path.write_text(json.dumps({
+            payload = {
                 'watch': watch_mode[0], 'board': board, 'current_turn': current_turn[0],
                 'history': history, 'cursor': cursor[0],
-            }, default=list, separators=(',', ':')), encoding='utf-8')
-        except (OSError, TypeError, ValueError):
+            }
+            autosave_path.write_bytes(save_magic + zlib.compress(pickle.dumps(payload, protocol=5), 9))
+        except (OSError, TypeError, ValueError, pickle.PickleError):
             pass
+
+    def clear_autosave():
+        if autosave_path is not None:
+            try:
+                autosave_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def restore_autosave():
+        if autosave_path is None or not autosave_path.exists():
+            return False
+        try:
+            data = autosave_path.read_bytes()
+            if data.startswith(save_magic):
+                payload = pickle.loads(zlib.decompress(data[len(save_magic):]))
+            else:
+                payload = json.loads(data.decode('utf-8'))
+            board[:] = [line[:] for line in payload['board']]
+            watch_mode[0] = bool(payload.get('watch', False))
+            current_turn[0] = int(payload.get('current_turn', 1))
+            history[:] = payload.get('history', [])
+            cursor[0] = min(int(payload.get('cursor', len(history))), len(history))
+            if cursor[0]:
+                entry = history[cursor[0] - 1]
+                last_move[0] = tuple(entry.get('move', (entry.get('row', 0), entry.get('column', 0))))
+                winning_cells[0] = {tuple(cell) for cell in entry.get('wins', ())}
+                winner_player[0] = entry.get('winner')
+            persist()
+            return True
+        except (OSError, EOFError, ValueError, TypeError, KeyError, UnicodeError, pickle.PickleError, zlib.error):
+            return False
 
     def announce_player_turn():
         line = CONNECT_FOUR_PLAYER_TURN_LINES[
@@ -373,7 +423,7 @@ def create_connect_four_window(
         on_turn('enable_player')
 
     def enable_player_turn():
-        if active[0] and current_turn[0] == 1:
+        if active[0] and not player_is_cpu(current_turn[0]):
             status.setText('Your turn')
             set_columns_enabled(True)
 
@@ -387,7 +437,7 @@ def create_connect_four_window(
         player = current_turn[0]
         if not active[0] or player not in (1, 2):
             return
-        if not watch_mode[0] and player != 2:
+        if not player_is_cpu(player):
             return
         column = choose_cpu_move(board, player)
         if column is None:
@@ -411,20 +461,23 @@ def create_connect_four_window(
             on_turn('announce_player')
 
     def human_move(column):
-        if watch_mode[0] or not active[0] or current_turn[0] != 1 or board[0][column] != 0:
+        if not active[0] or player_is_cpu(current_turn[0]) or board[0][column] != 0:
             return
+        player = current_turn[0]
         set_columns_enabled(False)
-        row = drop(board, column, 1)
-        record_move(1, row, column)
+        row = drop(board, column, player)
+        record_move(player, row, column)
         refresh_board()
         if winning_cells[0]:
-            finish_round(True)
+            finish_round(True if player == 1 else False)
         elif not available_columns(board):
             finish_round(None)
-        else:
+        elif player_is_cpu(current_turn[0]):
             say(CONNECT_FOUR_MY_TURN_LINE)
             status.setText("Mario's turn")
             on_turn('cpu')
+        else:
+            announce_player_turn()
 
     def snapshot_board(current):
         return [line[:] for line in current]
@@ -540,6 +593,35 @@ def create_connect_four_window(
 
     def reset_game(watch=None):
         nonlocal board
+        if not restored[0] and restore_autosave():
+            restored[0] = True
+            continue_button.hide()
+            active[0] = True
+            refresh_board()
+            status.setText('Mario and Luigi are ready' if watch_mode[0] else 'Mario is ready')
+            set_columns_enabled(False)
+            say('You have an autosave available! Do you want to continue?')
+            def ask_resume():
+                buttons = QtWidgets.QMessageBox.StandardButton
+                answer = QtWidgets.QMessageBox.question(
+                    window, 'Hey!', 'You have an autosave available! Do you want to continue?',
+                    buttons.Yes | buttons.No, buttons.Yes
+                )
+                if answer == buttons.No:
+                    clear_autosave()
+                    restored[0] = True
+                    reset_game(watch)
+                    return
+                if watch_mode[0]:
+                    on_turn('watch_mario' if current_turn[0] == 2 else 'watch_luigi')
+                elif current_turn[0] == 1:
+                    on_turn('enable_player')
+                else:
+                    on_turn('cpu')
+            QtCore.QTimer.singleShot(1200, ask_resume)
+            return
+        restored[0] = True
+        completed[0] = False
         luigi_timer.stop()
         continue_button.hide()
         player_turn_line_index[0] = 0

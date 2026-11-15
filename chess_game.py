@@ -4,7 +4,7 @@ from board_game_window import create_board_game_window
 from game_difficulty import try_random_move
 
 
-def create_chess_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
+def create_chess_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None, player_specs=None):
     import chess
     import chess.svg
 
@@ -54,5 +54,5 @@ def create_chess_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_
         chess.Board, draw, move, legal_moves=choices,
         hit_test=lambda x, y: chess.square(int(x // 60), 7 - int(y // 60)),
         marker=lambda cell: ((cell % 8) * 60 + 30, (7 - cell // 8) * 60 + 30),
-        say=say, speech_busy=speech_busy, cpu_move=lambda board, player, level: best_move(board, level).uci(), autosave_path=autosave_path,
+        say=say, speech_busy=speech_busy, cpu_move=lambda board, player, level: best_move(board, level).uci(), autosave_path=autosave_path, player_specs=player_specs,
     )

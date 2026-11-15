@@ -420,13 +420,17 @@ def create_exploding_blocks_window(QtCore, QtWidgets, on_close, play_clear_sound
         score += PLACEMENT_POINTS[rank]
         if lines:
             speech_queue.append("Boom!")
-            if available_before <= 1:
-                speech_queue.append(random.choice(CLUTCH_LINES))
-        speech_queue.append(praise)
         if lines:
             for square in cleared:
                 del occupied[square]
             burst.update(cleared)
+            remaining_playable = sum(
+                any(placement(occupied, piece, (x, y)) is not None
+                    for y in range(SIZE) for x in range(SIZE))
+                for index, piece in enumerate(hand) if piece and index != dragging
+            )
+            if available_before <= 1 and remaining_playable >= 2:
+                speech_queue.append(random.choice(CLUTCH_LINES))
             gained = lines * POINTS_PER_LINE
             score += gained
             scoreboard.setText(f'{score:,} points · Stage {stage} · Turn {turn}')
@@ -442,6 +446,7 @@ def create_exploding_blocks_window(QtCore, QtWidgets, on_close, play_clear_sound
             board.update()
         else:
             next_piece()
+        speech_queue.append(praise)
         new_stage = score // 100000 + 1
         if new_stage > stage:
             speech_queue.extend(['All clear!'] * (new_stage - stage))
@@ -535,7 +540,7 @@ def create_exploding_blocks_window(QtCore, QtWidgets, on_close, play_clear_sound
         redo.setEnabled(move_cursor + 1 < len(move_states) and not ending)
 
     def restore_state(state, cursor):
-        nonlocal hand, score, stage, turn, snapshots, background, move_cursor
+        nonlocal hand, score, stage, turn, snapshots, background, move_cursor, speech_active
         dialogue_timer.stop()
         speech_queue.clear()
         speech_active = False
@@ -551,6 +556,7 @@ def create_exploding_blocks_window(QtCore, QtWidgets, on_close, play_clear_sound
         move_cursor = cursor
         update_hand()
         autosave()
+        dialogue_timer.start()
         undo.setEnabled(move_cursor > 0)
         redo.setEnabled(move_cursor + 1 < len(move_states))
 

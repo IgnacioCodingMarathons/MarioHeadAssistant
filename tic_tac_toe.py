@@ -59,9 +59,9 @@ def board_svg(board, mover=None, last_cell=None):
     return ''.join(parts)
 
 
-def create_tic_tac_toe_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None):
+def create_tic_tac_toe_window(QtCore, QtWidgets, on_close, say, speech_busy, autosave_path=None, player_specs=None):
     return create_board_game_window(
         QtCore, QtWidgets, on_close, TITLE, 'Click an empty square to play X. Mario plays O.',
         ('',) * 9, board_svg, move, board_cells=True, cpu_move=lambda board, player, level: cpu_cell(board, 'O' if player else 'X', level),
-        say=say, speech_busy=speech_busy, autosave_path=autosave_path,
+        say=say, speech_busy=speech_busy, autosave_path=autosave_path, player_specs=player_specs,
     )
