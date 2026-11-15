@@ -14,6 +14,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--assets', required=True)
     parser.add_argument('--ffmpeg', required=True)
+    parser.add_argument('--archive')
+    parser.add_argument('--trust-archive', action='store_true')
     args = parser.parse_args()
     protocol = sys.stdout
     sys.stdout = sys.stderr
@@ -24,6 +26,9 @@ def main():
         from sentence_mixer import LiveSentenceMixer
 
         mixer = LiveSentenceMixer(Path(args.assets), args.ffmpeg)
+        if args.archive:
+            mixer.archive_path = Path(args.archive)
+        mixer.trust_archive = args.trust_archive
         mixer.enabled = True
         mixer.started = True
         mixer._load_engine()
@@ -53,6 +58,8 @@ def main():
                         'audio': base64.b64encode(media['audio']).decode('ascii'),
                         'video': str(media['video']),
                         'text': media['text'],
+                        'phonemes': media.get('phonemes', ''),
+                        'premixes_used': media.get('premixes_used', 0),
                     }})
                 else:
                     send(protocol, {'ok': True, 'media': {

@@ -1,12 +1,16 @@
 import math
 import random
 import threading
+import tempfile
 import urllib.request
 from pathlib import Path
 
 DEFAULT_SETTINGS = {
     'chattiness': 5,
     'playfulness': 5,
+    'random_minigames': ['eye'],
+    'away_mode': False,
+    'proactivity': 0,
     'wandering': 5,
     'use_entropy_for_position': False,
     'zen_mode': False,
@@ -24,6 +28,8 @@ DEFAULT_SETTINGS = {
     'wake_word_sensitivity': 5,
     'finish_sensitivity': 5,
     'tts_live_sentence_mixing': False,
+    'tts_subtitles': True,
+    'song_extra_folders': [],
     'weather_city': '',
     'weather_country_code': '',
 }
@@ -41,7 +47,13 @@ def idle_delay(level):
     return random_delay(level, 45, 90) * (1 - level / 20)
 
 
-def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
+def proactivity_delay(level):
+    return random_delay(level, 240, 480)
+
+
+def create_settings_window(
+        QtCore, QtWidgets, values, changed, assets_dir=None,
+        song_extensions=None, streamable_song_extensions=None, clear_cache=None):
     from PySide6 import QtGui
 
     window = QtWidgets.QWidget()
@@ -61,9 +73,10 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
         tabs.addTab(scroll, title)
 
     for title, sliders, checks in (
-        ('Conversation', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness')],
+        ('Conversation', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness'),
+                          ('Proactivity', 'proactivity')],
          [('Zen Mode', 'zen_mode'), ('Super Zen Mode', 'super_zen_mode'),
-          ('"Oh, sorry!"', 'oh_sorry')]),
+          ('"Oh, sorry!"', 'oh_sorry'), ('Away mode', 'away_mode')]),
         ('Movement', [('Wandering', 'wandering')],
          [('Use entropy for position', 'use_entropy_for_position')]),
         ('Pet Care', [('Caring Difficulty', 'caring_difficulty')], [('Autofeed', 'autofeed')]),
@@ -91,6 +104,69 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
             check.toggled.connect(lambda value, field=name: changed(field, value))
             controls[name] = check
             form.addRow(check)
+        if title == 'Conversation':
+            form.addRow(QtWidgets.QLabel('Randomly scheduled minigames'))
+            random_minigames = QtWidgets.QListWidget()
+            random_minigames.setObjectName('random_minigames')
+            minigame_labels = {
+                'eye': 'Hey, I Got Something In My Eye!',
+                'tunnel': "Mario's Tunnel of Doom",
+            }
+            selected = values.get('random_minigames', ['eye'])
+            if not isinstance(selected, (list, tuple)):
+                selected = ['eye']
+            selected = list(dict.fromkeys(
+                game for game in selected if game in minigame_labels
+            ))
+            for game in selected:
+                item = QtWidgets.QListWidgetItem(minigame_labels[game])
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, game)
+                random_minigames.addItem(item)
+            form.addRow(random_minigames)
+            minigame_buttons = QtWidgets.QHBoxLayout()
+            add_minigame = QtWidgets.QPushButton('Add minigame…')
+            remove_minigame = QtWidgets.QPushButton('Remove selected')
+            minigame_buttons.addWidget(add_minigame)
+            minigame_buttons.addWidget(remove_minigame)
+            minigame_buttons_widget = QtWidgets.QWidget()
+            minigame_buttons_widget.setLayout(minigame_buttons)
+            form.addRow(minigame_buttons_widget)
+
+            def save_random_minigames():
+                changed('random_minigames', [
+                    random_minigames.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
+                    for row in range(random_minigames.count())
+                ])
+
+            def add_random_minigame():
+                present = {
+                    random_minigames.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
+                    for row in range(random_minigames.count())
+                }
+                available = [game for game in minigame_labels if game not in present]
+                if not available:
+                    return
+                labels = [minigame_labels[game] for game in available]
+                label, accepted = QtWidgets.QInputDialog.getItem(
+                    window, 'Add randomly scheduled minigame',
+                    'Minigame:', labels, 0, False,
+                )
+                if accepted:
+                    game = available[labels.index(label)]
+                    item = QtWidgets.QListWidgetItem(minigame_labels[game])
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, game)
+                    random_minigames.addItem(item)
+                    save_random_minigames()
+
+            def remove_random_minigame():
+                row = random_minigames.currentRow()
+                if row >= 0:
+                    random_minigames.takeItem(row)
+                    save_random_minigames()
+
+            add_minigame.clicked.connect(add_random_minigame)
+            remove_minigame.clicked.connect(remove_random_minigame)
+            controls['random_minigames'] = random_minigames
         add_scroll_tab(page, title)
 
     assets_dir = Path(assets_dir) if assets_dir is not None else Path(__file__).resolve().parent / 'assets'
@@ -191,7 +267,105 @@ def create_settings_window(QtCore, QtWidgets, values, changed, assets_dir=None):
     )
     controls['tts_live_sentence_mixing'] = live_sentence_mixing
     tts_layout.addWidget(live_sentence_mixing)
+    subtitles = QtWidgets.QCheckBox('Subtitles')
+    subtitles.setChecked(values.get('tts_subtitles', True))
+    subtitles.toggled.connect(lambda value: changed('tts_subtitles', value))
+    controls['tts_subtitles'] = subtitles
+    tts_layout.addWidget(subtitles)
     add_scroll_tab(tts_page, 'TTS')
+
+    songs_page = QtWidgets.QWidget()
+    songs_layout = QtWidgets.QVBoxLayout(songs_page)
+    supported = sorted(song_extensions or ())
+    streamed = sorted(streamable_song_extensions or ())
+    loaded = sorted(set(supported) - set(streamed))
+    formats_label = QtWidgets.QLabel(
+        'Supported formats: ' + (', '.join(supported) or 'Unavailable') + '\n\n'
+        'Loaded into memory before playback: ' + (', '.join(loaded) or 'None') + '\n\n'
+        'Streamed from the drive: ' + (', '.join(streamed) or 'None')
+    )
+    formats_label.setWordWrap(True)
+    songs_layout.addWidget(formats_label)
+    songs_layout.addWidget(QtWidgets.QLabel('Extra Song Folders'))
+    song_folders = QtWidgets.QListWidget()
+    song_folders.setObjectName('song_extra_folders')
+    folders = values.get('song_extra_folders', [])
+    if isinstance(folders, (tuple, list)):
+        for folder in folders:
+            if str(folder).strip():
+                song_folders.addItem(str(folder))
+    songs_layout.addWidget(song_folders, 1)
+    song_folder_buttons = QtWidgets.QHBoxLayout()
+    add_song_folder = QtWidgets.QPushButton('Add Folder…')
+    remove_song_folder = QtWidgets.QPushButton('Remove Selected')
+    song_folder_buttons.addWidget(add_song_folder)
+    song_folder_buttons.addWidget(remove_song_folder)
+    songs_layout.addLayout(song_folder_buttons)
+
+    def update_song_folders():
+        changed('song_extra_folders', [
+            song_folders.item(row).text()
+            for row in range(song_folders.count())
+        ])
+
+    def add_song_directory():
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            window, 'Add Extra Song Folder'
+        )
+        if not folder:
+            return
+        selected = Path(folder).expanduser()
+        selected_key = str(selected.resolve())
+        existing = {
+            str(Path(song_folders.item(row).text()).expanduser().resolve())
+            for row in range(song_folders.count())
+        }
+        if selected_key in existing:
+            return
+        song_folders.addItem(str(selected))
+        update_song_folders()
+
+    def remove_song_directory():
+        row = song_folders.currentRow()
+        if row < 0:
+            return
+        song_folders.takeItem(row)
+        update_song_folders()
+
+    add_song_folder.clicked.connect(add_song_directory)
+    remove_song_folder.clicked.connect(remove_song_directory)
+    controls['song_extra_folders'] = song_folders
+    add_scroll_tab(songs_page, 'Songs')
+
+    advanced_page = QtWidgets.QWidget()
+    advanced_layout = QtWidgets.QVBoxLayout(advanced_page)
+    cache_root = Path(tempfile.gettempdir()) / 'marioassistant'
+    cache_label = QtWidgets.QLabel(
+        f'Cached sentence mixes and other Mario cache files are stored in {cache_root}. '
+        'They stay there until you clear the cache.'
+    )
+    cache_label.setWordWrap(True)
+    advanced_layout.addWidget(cache_label)
+    clear_cache_button = QtWidgets.QPushButton('Clear cache')
+
+    def clear_cache_clicked():
+        if clear_cache is None:
+            return
+        try:
+            clear_cache()
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                window, 'Clear cache', f'Could not clear Mario’s cache.\n{exc}'
+            )
+        else:
+            QtWidgets.QMessageBox.information(
+                window, 'Clear cache', 'Mario’s cache has been cleared.'
+            )
+
+    clear_cache_button.clicked.connect(clear_cache_clicked)
+    advanced_layout.addWidget(clear_cache_button)
+    advanced_layout.addStretch(1)
+    add_scroll_tab(advanced_page, 'Advanced')
 
     weather_page = QtWidgets.QWidget()
     weather_form = QtWidgets.QFormLayout(weather_page)

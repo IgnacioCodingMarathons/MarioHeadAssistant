@@ -10,3 +10,4 @@ pydub>=0.25.1
 sentence-mixing==2.0.4
 moviepy>=1.0.3,<2
 zstandard>=0.23.0
+python-chess>=1.999

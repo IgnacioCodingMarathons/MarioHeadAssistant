@@ -1,12 +1,64 @@
 import struct
+import re
+import unicodedata
 from pathlib import Path
 
 
 MAGIC = b'MARIOSMX'
-VERSION = 13
+VERSION = 18
 MODEL_NAME = 'mario_sentence_mixer.bin'
 VOWELS = frozenset('AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW'.split())
 HEADER = struct.Struct('<8sIIHHIIQ')
+
+
+def premix_key(sentence, case_sensitive=False, punctuation_sensitive=False):
+    value = ' '.join(str(sentence).split())
+    parts = []
+    for part in re.split(r'(\\[^\\]*\\)', value):
+        if len(part) >= 2 and part.startswith('\\') and part.endswith('\\'):
+            normalized = part
+        elif punctuation_sensitive:
+            normalized = part
+        else:
+            normalized = ''.join(
+                character for character in part
+                if not unicodedata.category(character).startswith('P')
+            )
+        parts.append(normalized)
+    value = ' '.join(''.join(parts).split())
+    return value if case_sensitive else value.casefold()
+
+
+def premix_lookup(premixes):
+    lookup = {}
+    for premix in premixes:
+        case_sensitive = bool(premix.get('case_sensitive', False))
+        punctuation_sensitive = bool(premix.get('punctuation_sensitive', False))
+        use_pronunciation = bool(premix.get('use_pronunciation_as_first_match', False))
+        matches = premix.get('all_matches')
+        if matches is None:
+            legacy = premix.get('pronunciation_sentence', premix.get('sentence', ''))
+            matches = [legacy] if legacy else []
+        else:
+            matches = list(matches)
+        pronunciation = premix.get(
+            'pronunciation_sentence', premix.get('sentence', '')
+        )
+        if use_pronunciation and pronunciation:
+            pronunciation_key = premix_key(
+                pronunciation, case_sensitive, punctuation_sensitive
+            )
+            matches = [
+                match for match in matches
+                if premix_key(match, case_sensitive, punctuation_sensitive)
+                != pronunciation_key
+            ]
+            matches.insert(0, pronunciation)
+        for match in matches:
+            key_text = premix_key(match, case_sensitive, punctuation_sensitive)
+            if key_text:
+                lookup[(case_sensitive, punctuation_sensitive, key_text)] = premix
+    return lookup
 
 
 def write_model(path, index, audio):
@@ -51,6 +103,42 @@ def write_model(path, index, audio):
                 text(phone)
                 pack('BQQ', phone in VOWELS, round(start * sample_rate),
                      round(end * sample_rate))
+    premixes = index.get('premixes', [])
+    pack('I', len(premixes))
+    for premix in premixes:
+        legacy_sentence = premix.get('sentence', '')
+        text(premix.get('pronunciation_sentence', legacy_sentence))
+        pack('B', bool(premix.get('case_sensitive', False)))
+        pack('B', bool(premix.get('punctuation_sensitive', False)))
+        pack('B', bool(premix.get('use_pronunciation_as_first_match', False)))
+        text(premix.get('phonemes', ''))
+        all_matches = premix.get('all_matches')
+        if all_matches is None:
+            all_matches = [premix.get('pronunciation_sentence', legacy_sentence)]
+        all_matches = [str(match).strip() for match in all_matches if str(match).strip()]
+        if premix.get('use_pronunciation_as_first_match'):
+            pronunciation = str(
+                premix.get('pronunciation_sentence', legacy_sentence)
+            ).strip()
+            if pronunciation:
+                pronunciation_key = premix_key(
+                    pronunciation,
+                    bool(premix.get('case_sensitive', False)),
+                    bool(premix.get('punctuation_sensitive', False)),
+                )
+                all_matches = [
+                    match for match in all_matches
+                    if premix_key(
+                        match,
+                        bool(premix.get('case_sensitive', False)),
+                        bool(premix.get('punctuation_sensitive', False)),
+                    ) != pronunciation_key
+                ]
+        pack('I', len(all_matches))
+        for match in all_matches:
+            text(match)
+        pack('Q', 0)
+        pack('Q', 0)
     header = HEADER.pack(MAGIC, VERSION, sample_rate, 1, 2,
                          len(sources), len(fingerprints), len(metadata))
     import zstandard
@@ -77,7 +165,7 @@ def read_model(path):
         if len(raw_header) != HEADER.size:
             raise ValueError('Truncated sentence-mixing header')
         magic, version, rate, channels, width, count, files, size = HEADER.unpack(raw_header)
-        if magic != MAGIC or version not in (6, 7, 8, 9, 10, 11, 12, VERSION):
+        if magic != MAGIC or not 6 <= version <= VERSION:
             raise ValueError('Unsupported sentence-mixing binary format')
         if rate != 16000 or channels != 1 or width != 2:
             raise ValueError('Unsupported sentence-mixing audio format')
@@ -132,6 +220,7 @@ def read_model(path):
         name = text()
         fingerprints[name] = list(unpack('QQ'))
     sources = []
+    premixes = []
     expected_offset = 0
     for _ in range(count):
         name = text()
@@ -178,6 +267,36 @@ def read_model(path):
         sources.append({'name': name, 'offset': offset, 'length': length,
                         'audio_only': bool(audio_only), 'words': words,
                         'time_map': time_map})
+    if version >= 14:
+        premix_count, = unpack('I')
+        for _ in range(premix_count):
+            sentence = text()
+            case_sensitive = bool(unpack('B')[0]) if version >= 15 else False
+            punctuation_sensitive = bool(unpack('B')[0]) if version >= 17 else False
+            use_pronunciation = bool(unpack('B')[0]) if version >= 18 else False
+            phonemes = text()
+            if version >= 16:
+                match_count, = unpack('I')
+                all_matches = [text() for _ in range(match_count)]
+            else:
+                all_matches = [sentence] if sentence else []
+            audio_length, = unpack('Q')
+            if cursor + audio_length > len(metadata):
+                raise ValueError('Truncated premixed sentence audio')
+            premix_audio = bytes(metadata[cursor:cursor + audio_length])
+            cursor += audio_length
+            video_length, = unpack('Q')
+            if cursor + video_length > len(metadata):
+                raise ValueError('Truncated premixed sentence video')
+            premix_video = bytes(metadata[cursor:cursor + video_length])
+            cursor += video_length
+            premixes.append({'pronunciation_sentence': sentence,
+                             'all_matches': all_matches,
+                             'case_sensitive': case_sensitive,
+                             'punctuation_sensitive': punctuation_sensitive,
+                             'use_pronunciation_as_first_match': use_pronunciation,
+                             'phonemes': phonemes,
+                             'audio': premix_audio, 'video': premix_video})
     padding = metadata[cursor:]
     if version == 9:
         if len(padding) > 7 or any(padding) or (HEADER.size + len(metadata)) % 8:
@@ -192,4 +311,4 @@ def read_model(path):
         raise ValueError('Invalid sentence-mixing duplicate reference')
     return {'version': version, 'sample_rate': rate, 'channels': channels,
             'sources': sources, 'source_files': fingerprints,
-            'duplicates': duplicates}, audio
+            'duplicates': duplicates, 'premixes': premixes}, audio

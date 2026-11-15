@@ -732,6 +732,8 @@ def interpret_voice_command(transcript):
     def contains(phrase):
         return re.search(r"\b" + re.escape(phrase) + r"\b", text) is not None
 
+    if re.fullmatch(r'stop(?: the)? music', text):
+        return 'stop_music'
     if any(contains(phrase) for phrase in (
         "stop", "shut up", "skip", "silence", "shut your mouth", "stop it",
     )):
@@ -805,6 +807,15 @@ def interpret_voice_command(transcript):
     )
     if "play" in words and "random" in words and has_minigame:
         return "random_minigame"
+    if re.fullmatch(r"play (?:a )?random song", text):
+        return "random_song"
+    cd_track = re.fullmatch(r"play(?: track)? (.+)", text)
+    if cd_track is not None:
+        track_number = parse_voice_number(cd_track.group(1))
+        if track_number is not None and float(track_number).is_integer():
+            track_number = int(track_number)
+            if 1 <= track_number <= 99:
+                return f"cd_track:{track_number}"
     if (
         "minigames" in words
         and ("open" in words or "interactive" in words or "mario" in words)
@@ -822,6 +833,10 @@ def interpret_voice_command(transcript):
         and "eye" in words
     ):
         return "eye"
+    if text.startswith('play '):
+        song_query = text[5:].strip()
+        if song_query and song_query not in ('a song', 'song'):
+            return f'song_query:{song_query}'
     if "debug" in words:
         return "superdebug"
     if "pet" in words and "care" in words:
@@ -873,3 +888,107 @@ def parse_voice_number(text):
         number = small_numbers[tokens[0]] * 100 + remainder
         return number if number <= 100 else None
     return None
+
+
+class LoudSoundListener:
+    def __init__(self, events, cooldown=12.0):
+        self.events = events
+        self.cooldown = cooldown
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.device = None
+        self.chunks = queue.Queue(maxsize=8)
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return False
+        self.stop_event.clear()
+        while True:
+            try:
+                self.chunks.get_nowait()
+            except queue.Empty:
+                break
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _capture(self, device, audio):
+        try:
+            self.chunks.put_nowait(bytes(audio))
+        except queue.Full:
+            try:
+                self.chunks.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.chunks.put_nowait(bytes(audio))
+            except queue.Full:
+                pass
+
+    def _rms(self, chunk):
+        count = len(chunk) // 2
+        if count == 0:
+            return 0.0
+        square_sum = sum(
+            sample[0] * sample[0]
+            for sample in struct.iter_unpack("<h", chunk[:count * 2])
+        )
+        return math.sqrt(square_sum / count)
+
+    def _listen(self):
+        device = None
+        try:
+            devices = get_audio_device_names(iscapture=True)
+            if not devices:
+                raise RuntimeError("No microphone input device is available")
+            device = AudioDevice(
+                devicename=devices[0],
+                iscapture=True,
+                frequency=SAMPLE_RATE,
+                audioformat=AUDIO_S16,
+                numchannels=1,
+                chunksize=1600,
+                allowed_changes=0,
+                callback=self._capture,
+            )
+            self.device = device
+            device.pause(0)
+            noise_floor = 300.0
+            last_alert = 0.0
+            calibrated_at = time.monotonic()
+            while not self.stop_event.is_set():
+                try:
+                    chunk = self.chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                now = time.monotonic()
+                rms = self._rms(chunk)
+                threshold = max(1800.0, noise_floor * 3.4)
+                if (now - calibrated_at >= 2.0 and rms >= threshold
+                        and now - last_alert >= self.cooldown):
+                    self.events.put(now)
+                    last_alert = now
+                if rms < noise_floor:
+                    noise_floor = max(80.0, noise_floor * 0.96 + rms * 0.04)
+                else:
+                    noise_floor = min(6000.0, noise_floor * 0.995 + rms * 0.005)
+        except Exception as exc:
+            print(
+                f"MarioAssistant away mode: microphone listener failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            if device is not None:
+                try:
+                    device.pause(1)
+                    device.close()
+                except Exception:
+                    pass
+            self.device = None

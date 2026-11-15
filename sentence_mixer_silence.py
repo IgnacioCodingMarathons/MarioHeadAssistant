@@ -71,4 +71,8 @@ def remap_words(words, time_map, sample_rate=16000):
                 phones.append((phone, *interval))
         if phones:
             remapped.append(dict(word, start=phones[0][1], end=phones[-1][2], phones=phones))
+        else:
+            interval = remap_interval(word['start'], word['end'])
+            if interval is not None and interval[0] < interval[1]:
+                remapped.append(dict(word, start=interval[0], end=interval[1], phones=[]))
     return remapped

@@ -1,7 +1,9 @@
 import argparse
+import atexit
 import array
 import bisect
 import copy
+from functools import lru_cache
 import io
 import json
 import math
@@ -18,7 +20,132 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from sentence_mixer_binary import MODEL_NAME, read_model, write_model
 
 
+class PremixTaskSignals(QtCore.QObject):
+    completed = QtCore.Signal(int, object, str)
+    progress = QtCore.Signal(str, int)
+
+
+class PremixTask(QtCore.QRunnable):
+    def __init__(self, row, indexed_pronunciations, indexed_variants, sentence, phonemes):
+        super().__init__()
+        self.row = row
+        self.indexed_pronunciations = indexed_pronunciations
+        self.indexed_variants = indexed_variants
+        self.sentence = sentence
+        self.phonemes = phonemes
+        self.signals = PremixTaskSignals()
+
+    def run(self):
+        try:
+            self.signals.progress.emit('Phonemizing the pronunciation sentence…', 20)
+            from sentence_mixer import phonemize_premix_sentence
+
+            phonemes = self.phonemes or phonemize_premix_sentence(
+                self.sentence, self.indexed_pronunciations, self.indexed_variants
+            )
+            self.signals.progress.emit('Applying phonemes to the premix…', 80)
+            result = {'phonemes': phonemes}
+            self.signals.completed.emit(self.row, result, '')
+        except Exception as exc:
+            self.signals.completed.emit(
+                self.row, None, f'{type(exc).__name__}: {exc}'
+            )
+
+
+class PremixPreviewTask(QtCore.QRunnable):
+    def __init__(self, row, assets_dir, archive_path, ffmpeg, sentence, phonemes):
+        super().__init__()
+        self.row = row
+        self.assets_dir = assets_dir
+        self.archive_path = archive_path
+        self.ffmpeg = ffmpeg
+        self.sentence = sentence
+        self.phonemes = phonemes
+        self.signals = PremixTaskSignals()
+
+    def run(self):
+        engine = None
+        try:
+            from sentence_mixer import LiveSentenceMixer
+
+            self.signals.progress.emit('Loading the processed audio index…', 15)
+            engine = LiveSentenceMixer(
+                self.assets_dir, self.ffmpeg, archive_path=self.archive_path,
+                trust_archive=True,
+            )
+            engine.set_enabled(True)
+            if not engine.load_done.wait(3600):
+                raise TimeoutError('The sentence mixer took too long to load.')
+            if not engine.ready:
+                raise RuntimeError('The sentence mixer could not load its audio index.')
+            engine.phonemized_patterns = {}
+            self.signals.progress.emit('Mixing audio and video preview…', 55)
+            text = sentence_with_premix_phonemes(self.sentence, self.phonemes)
+            media = engine.mix(text, with_video=True)
+            if media is None:
+                raise RuntimeError('Mario could not create the audio and video preview.')
+            video_path = Path(media['video'])
+            result = {
+                'audio': bytes(media['audio']),
+                'video': video_path.read_bytes(),
+                'text': media.get('text', ''),
+            }
+            video_path.unlink(missing_ok=True)
+            self.signals.completed.emit(self.row, result, '')
+        except Exception as exc:
+            self.signals.completed.emit(
+                self.row, None, f'{type(exc).__name__}: {exc}'
+            )
+        finally:
+            if engine is not None:
+                atexit.unregister(engine._stop_worker)
+                engine._stop_worker()
+                engine.temporary.cleanup()
+
+
 PHONEMES = set('AA AE AH AO AW AY B CH D DH EH ER EY F G HH IH IY JH K L M N NG OW OY P R S SH T TH UH UW V W Y Z ZH'.split())
+
+
+def sentence_with_premix_phonemes(sentence, phoneme_text):
+    tag_spans = [match.span() for match in re.finditer(r'\\[^\\]*\\', sentence)]
+    words = [
+        match for match in re.finditer(r"[a-z]+(?:'[a-z]+)*", sentence, re.IGNORECASE)
+        if not any(start <= match.start() < end for start, end in tag_spans)
+    ]
+    groups = [line.strip().split() for line in phoneme_text.splitlines() if line.strip()]
+    if len(words) != len(groups):
+        raise ValueError('Use one phoneme line per word in the sentence.')
+    parts = []
+    cursor = 0
+    for match, phones in zip(words, groups):
+        parts.append(sentence[cursor:match.start()])
+        if len(phones) == 1 and phones[0].isdigit():
+            parts.append(f"\\wvariant={phones[0]}\\")
+        else:
+            normalized = [phone.upper() for phone in phones]
+            if not normalized or any(phone not in PHONEMES for phone in normalized):
+                raise ValueError('Each phoneme line must contain valid ARPAbet phonemes separated by spaces.')
+            parts.append(f"\\premixpronunphoneme={','.join(normalized)}\\")
+        parts.append(match.group())
+        cursor = match.end()
+    parts.append(sentence[cursor:])
+    return ''.join(parts)
+
+
+def premix_list_label(premix):
+    matches = premix.get('all_matches') or []
+    sentence = next((match.strip() for match in matches if match.strip()), '')
+    sentence = sentence or premix.get('pronunciation_sentence', premix.get('sentence', '')).strip()
+    sentence = sentence or '(New premix)'
+    if premix.get('phonemes'):
+        sentence += '  ✓'
+    if premix.get('case_sensitive'):
+        sentence += '  (case sensitive)'
+    if premix.get('punctuation_sensitive'):
+        sentence += '  (punctuation sensitive)'
+    if premix.get('use_pronunciation_as_first_match'):
+        sentence += '  (pronunciation first)'
+    return sentence
 
 
 def edited_word(all_matches_text, start, end, rows, duration, rate):
@@ -395,6 +522,12 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.preview_sound = None
         self.preview_channel = None
         self.pronunciations = None
+        self.premix_loading = False
+        self.premix_task = None
+        self.premix_progress = None
+        self.premix_preview_task = None
+        self.premix_preview_progress = None
+        self.premix_preview_temp = None
         self.setWindowTitle('Mario sentence mixer editor')
         self.resize(780, 620)
         self.create_menus()
@@ -499,6 +632,7 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.create_experiments_tab()
+        self.create_premixed_tab()
 
     def create_menus(self):
         file_menu = self.menuBar().addMenu('&File')
@@ -556,6 +690,478 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
             shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
             shortcut.activated.connect(callback)
             self.experiment_shortcuts.append(shortcut)
+
+    def create_premixed_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.addWidget(QtWidgets.QLabel(
+            'Premixes store sentence matches and phonemes only. Mario generates audio/video at runtime; Preview renders a temporary video without saving media.'
+        ))
+        splitter = QtWidgets.QSplitter()
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self.premix_list = QtWidgets.QListWidget()
+        self.premix_list.currentRowChanged.connect(self.select_premix)
+        left_layout.addWidget(self.premix_list, 1)
+        list_buttons = QtWidgets.QHBoxLayout()
+        self.premix_add_button = self.button(list_buttons, 'Add', self.add_premix)
+        self.premix_remove_button = self.button(list_buttons, 'Remove', self.remove_premix)
+        left_layout.addLayout(list_buttons)
+        splitter.addWidget(left)
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(QtWidgets.QLabel('Pronunciation sentence'))
+        self.premix_pronunciation_sentence = QtWidgets.QPlainTextEdit()
+        self.premix_pronunciation_sentence.setPlaceholderText(
+            'The sentence used to create the pronunciation. Needed only for automatic mixing.'
+        )
+        self.premix_pronunciation_sentence.textChanged.connect(self.premix_text_changed)
+        right_layout.addWidget(self.premix_pronunciation_sentence, 1)
+        right_layout.addWidget(QtWidgets.QLabel('All matches'))
+        self.premix_all_matches = QtWidgets.QPlainTextEdit()
+        self.premix_all_matches.setPlaceholderText(
+            'Enter one or more matching phrases, one per line.'
+        )
+        self.premix_all_matches.textChanged.connect(self.premix_matches_changed)
+        right_layout.addWidget(self.premix_all_matches, 1)
+        right_layout.addWidget(QtWidgets.QLabel('Phoneme text'))
+        self.premix_phonemes = QtWidgets.QPlainTextEdit()
+        self.premix_phonemes.setPlaceholderText(
+            'One line per word. Separate ARPAbet phonemes with spaces; leave blank to auto-select.'
+        )
+        self.premix_phonemes.textChanged.connect(self.premix_text_changed)
+        right_layout.addWidget(self.premix_phonemes, 1)
+        self.premix_case_sensitive = QtWidgets.QCheckBox('Case sensitive')
+        self.premix_case_sensitive.setToolTip(
+            'When enabled, Mario only reuses this premix when the sentence casing matches.'
+        )
+        self.premix_case_sensitive.stateChanged.connect(self.premix_case_changed)
+        right_layout.addWidget(self.premix_case_sensitive)
+        self.premix_punctuation_sensitive = QtWidgets.QCheckBox('Punctuation sensitive')
+        self.premix_punctuation_sensitive.setToolTip(
+            'When enabled, Mario only reuses this premix when punctuation matches.'
+        )
+        self.premix_punctuation_sensitive.stateChanged.connect(
+            self.premix_punctuation_changed
+        )
+        right_layout.addWidget(self.premix_punctuation_sensitive)
+        self.premix_use_pronunciation = QtWidgets.QCheckBox(
+            'Use pronunciation text as first match'
+        )
+        self.premix_use_pronunciation.setToolTip(
+            'Include the pronunciation sentence as the first match without storing it again in All matches.'
+        )
+        self.premix_use_pronunciation.stateChanged.connect(
+            self.premix_use_pronunciation_changed
+        )
+        right_layout.addWidget(self.premix_use_pronunciation)
+        action_row = QtWidgets.QHBoxLayout()
+        self.premix_mix_button = self.button(
+            action_row, 'Phonemize automatically', self.mix_premix
+        )
+        self.premix_preview_button = self.button(action_row, 'Preview', self.preview_premix)
+        right_layout.addLayout(action_row)
+        splitter.addWidget(right)
+        splitter.setSizes([240, 540])
+        layout.addWidget(splitter, 1)
+        self.tabs.addTab(tab, 'Premixed')
+        self.update_premix_buttons()
+
+    def update_premix_buttons(self):
+        has_index = self.index is not None
+        self.premix_mix_button.setEnabled(has_index and self.premix_task is None)
+        self.premix_add_button.setEnabled(has_index and self.premix_task is None)
+        self.premix_remove_button.setEnabled(has_index and self.premix_task is None)
+        self.premix_list.setEnabled(self.premix_task is None)
+        self.premix_pronunciation_sentence.setEnabled(self.premix_task is None)
+        self.premix_all_matches.setEnabled(self.premix_task is None)
+        self.premix_phonemes.setEnabled(self.premix_task is None)
+        self.premix_case_sensitive.setEnabled(self.premix_task is None)
+        self.premix_punctuation_sensitive.setEnabled(self.premix_task is None)
+        self.premix_use_pronunciation.setEnabled(self.premix_task is None)
+        row = self.premix_list.currentRow()
+        valid = has_index and 0 <= row < len(self.index.get('premixes', []))
+        self.premix_preview_button.setEnabled(
+            valid and self.premix_task is None and self.premix_preview_task is None
+            and bool(self.index['premixes'][row].get('phonemes'))
+        )
+
+    def refresh_premix_list(self, selected=-1):
+        self.premix_loading = True
+        self.premix_list.blockSignals(True)
+        self.premix_list.clear()
+        premixes = self.index.get('premixes', []) if self.index is not None else []
+        for premix in premixes:
+            self.premix_list.addItem(premix_list_label(premix))
+        if 0 <= selected < len(premixes):
+            self.premix_list.setCurrentRow(selected)
+        elif premixes:
+            self.premix_list.setCurrentRow(0)
+        else:
+            self.premix_pronunciation_sentence.clear()
+            self.premix_all_matches.clear()
+            self.premix_phonemes.clear()
+            self.premix_case_sensitive.setChecked(False)
+            self.premix_punctuation_sensitive.setChecked(False)
+            self.premix_use_pronunciation.setChecked(False)
+        self.premix_list.blockSignals(False)
+        self.premix_loading = False
+        self.select_premix(self.premix_list.currentRow())
+
+    def select_premix(self, row):
+        self.premix_loading = True
+        premixes = self.index.get('premixes', []) if self.index is not None else []
+        premix = premixes[row] if 0 <= row < len(premixes) else None
+        self.premix_pronunciation_sentence.setPlainText(
+            premix.get('pronunciation_sentence', premix.get('sentence', '')) if premix else ''
+        )
+        matches = premix.get('all_matches') if premix else []
+        if premix and matches is None:
+            legacy = premix.get('sentence', '')
+            matches = [legacy] if legacy else []
+        self.premix_all_matches.setPlainText('\n'.join(matches or []))
+        self.premix_phonemes.setPlainText(premix.get('phonemes', '') if premix else '')
+        self.premix_case_sensitive.setChecked(
+            bool(premix.get('case_sensitive', False)) if premix else False
+        )
+        self.premix_punctuation_sensitive.setChecked(
+            bool(premix.get('punctuation_sensitive', False)) if premix else False
+        )
+        self.premix_use_pronunciation.setChecked(
+            bool(premix.get('use_pronunciation_as_first_match', False))
+            if premix else False
+        )
+        self.premix_loading = False
+        self.update_premix_buttons()
+
+    def premix_text_changed(self):
+        if self.premix_loading or self.index is None or self.premix_task is not None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        sentence = self.premix_pronunciation_sentence.toPlainText().strip()
+        phonemes = self.premix_phonemes.toPlainText().strip()
+        sentence_changed = sentence != premix.get('pronunciation_sentence', premix.get('sentence', ''))
+        phonemes_changed = phonemes != premix.get('phonemes', '')
+        if sentence_changed and not phonemes_changed and phonemes:
+            self.premix_loading = True
+            self.premix_phonemes.clear()
+            self.premix_loading = False
+            phonemes = ''
+        if sentence_changed or phonemes_changed:
+            premix['pronunciation_sentence'] = sentence
+            premix['phonemes'] = phonemes
+            premix['audio'] = b''
+            premix['video'] = b''
+            self.dirty = True
+            self.update_title()
+            item = self.premix_list.item(row)
+            if item is not None:
+                item.setText(premix_list_label(premix))
+            self.update_premix_buttons()
+
+    def premix_matches_changed(self):
+        if self.premix_loading or self.index is None or self.premix_task is not None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        matches = [line.strip() for line in self.premix_all_matches.toPlainText().splitlines()
+                   if line.strip()]
+        if matches == premix.get('all_matches', []):
+            return
+        premix['all_matches'] = matches
+        self.dirty = True
+        self.update_title()
+        item = self.premix_list.item(row)
+        if item is not None:
+            item.setText(premix_list_label(premix))
+        self.update_premix_buttons()
+
+    def premix_case_changed(self, state):
+        if self.premix_loading or self.index is None or self.premix_task is not None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        case_sensitive = bool(state)
+        if case_sensitive == bool(premix.get('case_sensitive', False)):
+            return
+        premix['case_sensitive'] = case_sensitive
+        self.dirty = True
+        self.update_title()
+        item = self.premix_list.item(row)
+        if item is not None:
+            item.setText(premix_list_label(premix))
+
+    def premix_punctuation_changed(self, state):
+        if self.premix_loading or self.index is None or self.premix_task is not None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        punctuation_sensitive = bool(state)
+        if punctuation_sensitive == bool(premix.get('punctuation_sensitive', False)):
+            return
+        premix['punctuation_sensitive'] = punctuation_sensitive
+        self.dirty = True
+        self.update_title()
+        item = self.premix_list.item(row)
+        if item is not None:
+            item.setText(premix_list_label(premix))
+
+    def premix_use_pronunciation_changed(self, state):
+        if self.premix_loading or self.index is None or self.premix_task is not None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        use_pronunciation = bool(state)
+        if use_pronunciation == bool(
+                premix.get('use_pronunciation_as_first_match', False)):
+            return
+        premix['use_pronunciation_as_first_match'] = use_pronunciation
+        self.dirty = True
+        self.update_title()
+        item = self.premix_list.item(row)
+        if item is not None:
+            item.setText(premix_list_label(premix))
+
+    def add_premix(self):
+        if self.premix_task is not None:
+            return
+        if self.index is None:
+            self.status.setText('Open a mixer index first.')
+            return
+        premixes = self.index.setdefault('premixes', [])
+        premixes.append({'pronunciation_sentence': '', 'all_matches': [],
+                         'case_sensitive': False,
+                         'punctuation_sensitive': False,
+                         'use_pronunciation_as_first_match': False,
+                         'phonemes': '', 'audio': b'', 'video': b''})
+        self.dirty = True
+        self.update_title()
+        self.refresh_premix_list(len(premixes) - 1)
+
+    def remove_premix(self):
+        if self.premix_task is not None:
+            return
+        if self.index is None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premixes.pop(row)
+        self.dirty = True
+        self.update_title()
+        self.refresh_premix_list(min(row, len(premixes) - 1))
+
+    def mix_premix(self):
+        if self.index is None or self.path is None:
+            self.error('Open and save the sentence-mixer index before creating a premix.')
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.setdefault('premixes', [])
+        if not 0 <= row < len(premixes):
+            self.error('Add or select a premix first.')
+            return
+        sentence = self.premix_pronunciation_sentence.toPlainText().strip()
+        matches = [line.strip() for line in self.premix_all_matches.toPlainText().splitlines()
+                   if line.strip()]
+        phonemes = self.premix_phonemes.toPlainText().strip()
+        if not sentence:
+            self.error('Enter a pronunciation sentence before mixing.')
+            return
+        use_pronunciation = self.premix_use_pronunciation.isChecked()
+        if not matches and not use_pronunciation:
+            self.error('Enter at least one item in All matches.')
+            return
+        if not self.commit_form():
+            return
+        premixes[row].update({
+            'pronunciation_sentence': sentence,
+            'all_matches': matches,
+            'use_pronunciation_as_first_match': use_pronunciation,
+        })
+        self.dirty = True
+        if not self.save():
+            self.update_premix_buttons()
+            return
+        self.refresh_premix_list(row)
+        from sentence_mixer import indexed_pronunciations_from_index, indexed_variants_from_index
+        indexed_pronunciations = indexed_pronunciations_from_index(self.index)
+        indexed_variants = indexed_variants_from_index(self.index)
+        task = PremixTask(row, indexed_pronunciations, indexed_variants, sentence, phonemes)
+        task.signals.completed.connect(self.premix_mix_completed)
+        task.signals.progress.connect(self.premix_progress_changed)
+        self.premix_task = task
+        self.update_premix_buttons()
+        self.premix_progress = QtWidgets.QProgressDialog(
+            'Starting automatic phonemization…', '', 0, 100, self
+        )
+        self.premix_progress.setWindowTitle('Phonemizing premix')
+        self.premix_progress.setCancelButton(None)
+        self.premix_progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        self.premix_progress.setMinimumDuration(0)
+        self.premix_progress.setAutoClose(False)
+        self.premix_progress.show()
+        self.status.setText('Automatically phonemizing the premixed sentence…')
+        QtCore.QThreadPool.globalInstance().start(task)
+
+    def premix_progress_changed(self, label, progress):
+        if self.premix_progress is not None:
+            self.premix_progress.setLabelText(label)
+            self.premix_progress.setValue(progress)
+
+    def premix_mix_completed(self, row, result, error):
+        self.premix_task = None
+        if self.premix_progress is not None:
+            self.premix_progress.setValue(100)
+            self.premix_progress.close()
+            self.premix_progress = None
+        if error:
+            self.error(f'Cannot create premix: {error}')
+        elif self.index is not None and 0 <= row < len(self.index.get('premixes', [])):
+            self.index['premixes'][row].update(result)
+            self.dirty = True
+            self.refresh_premix_list(row)
+            if not self.save():
+                self.status.setText('Premix created in memory; save the index to keep it.')
+            else:
+                self.status.setText('Premix phonemes generated and saved.')
+        self.update_premix_buttons()
+
+    def preview_premix(self):
+        if self.index is None:
+            return
+        row = self.premix_list.currentRow()
+        premixes = self.index.get('premixes', [])
+        if not 0 <= row < len(premixes):
+            return
+        premix = premixes[row]
+        if not premix.get('phonemes'):
+            self.error('Generate or enter phonemes before previewing this premix.')
+            return
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            self.error('FFmpeg is required to create a video preview.')
+            return
+        assets_dir = Path(__file__).resolve().parent / 'assets'
+        task = PremixPreviewTask(
+            row, assets_dir, self.path, ffmpeg,
+            premix.get('pronunciation_sentence', ''), premix['phonemes'],
+        )
+        task.signals.completed.connect(self.premix_preview_completed)
+        task.signals.progress.connect(self.premix_preview_progress_changed)
+        self.premix_preview_task = task
+        self.update_premix_buttons()
+        self.premix_preview_progress = QtWidgets.QProgressDialog(
+            'Preparing video preview…', '', 0, 100, self
+        )
+        self.premix_preview_progress.setWindowTitle('Premix Preview')
+        self.premix_preview_progress.setCancelButton(None)
+        self.premix_preview_progress.setWindowModality(
+            QtCore.Qt.WindowModality.WindowModal
+        )
+        self.premix_preview_progress.setMinimumDuration(0)
+        self.premix_preview_progress.setAutoClose(False)
+        self.premix_preview_progress.show()
+        QtCore.QThreadPool.globalInstance().start(task)
+
+    def premix_preview_progress_changed(self, label, progress):
+        if self.premix_preview_progress is not None:
+            self.premix_preview_progress.setLabelText(label)
+            self.premix_preview_progress.setValue(progress)
+
+    def premix_preview_completed(self, row, media, error):
+        self.premix_preview_task = None
+        if self.premix_preview_progress is not None:
+            self.premix_preview_progress.setValue(100)
+            self.premix_preview_progress.close()
+            self.premix_preview_progress = None
+        self.update_premix_buttons()
+        if error:
+            self.error(f'Cannot preview premix: {error}')
+            return
+        self.show_premix_video_preview(media)
+
+    def show_premix_video_preview(self, media):
+        ffmpeg = shutil.which('ffmpeg')
+        temporary = None
+        try:
+            if self.premix_preview_temp is not None:
+                self.premix_preview_temp.cleanup()
+            temporary = tempfile.TemporaryDirectory(prefix='mario-premix-preview-')
+            self.premix_preview_temp = temporary
+            folder = Path(temporary.name)
+            video_path = folder / 'video.mp4'
+            audio_path = folder / 'audio.wav'
+            preview_path = folder / 'preview.mp4'
+            video_path.write_bytes(media['video'])
+            audio_path.write_bytes(media['audio'])
+            subprocess.run(
+                [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(video_path),
+                 '-i', str(audio_path), '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
+                 '-c:a', 'aac', '-shortest', str(preview_path)],
+                check=True, capture_output=True, text=True,
+            )
+            try:
+                from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+                from PySide6.QtMultimediaWidgets import QVideoWidget
+            except ImportError:
+                if not QtGui.QDesktopServices.openUrl(
+                        QtCore.QUrl.fromLocalFile(str(preview_path))):
+                    raise RuntimeError(
+                        'Qt Multimedia is unavailable and no system video player opened.'
+                    )
+                self.status.setText('Opened the dynamically generated premix preview.')
+                return
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle('Premix Preview')
+            dialog.resize(640, 520)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            video_widget = QVideoWidget(dialog)
+            layout.addWidget(video_widget, 1)
+            controls = QtWidgets.QHBoxLayout()
+            play_button = QtWidgets.QPushButton('Play again')
+            close_button = QtWidgets.QPushButton('Close')
+            controls.addWidget(play_button)
+            controls.addStretch(1)
+            controls.addWidget(close_button)
+            layout.addLayout(controls)
+            player = QMediaPlayer(dialog)
+            audio_output = QAudioOutput(dialog)
+            player.setAudioOutput(audio_output)
+            player.setVideoOutput(video_widget)
+            player.setSource(QtCore.QUrl.fromLocalFile(str(preview_path)))
+            play_button.clicked.connect(player.play)
+            close_button.clicked.connect(dialog.accept)
+            dialog.finished.connect(player.stop)
+            player.play()
+            dialog.exec()
+            player.stop()
+            temporary.cleanup()
+            self.premix_preview_temp = None
+        except Exception as exc:
+            if temporary is not None:
+                temporary.cleanup()
+            self.premix_preview_temp = None
+            self.error(f'Cannot preview premix: {exc}')
 
     def button(self, layout, label, callback):
         button = QtWidgets.QPushButton(label)
@@ -734,6 +1340,9 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         return response == QtWidgets.QMessageBox.StandardButton.Discard
 
     def open_file(self, path):
+        if self.premix_task is not None:
+            self.error('Wait for the current premix to finish before opening another index.')
+            return False
         if not self.confirm_discard():
             return False
         try:
@@ -744,6 +1353,7 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.stop_audio()
         self.loading = True
         self.path, self.index, self.audio = Path(path), index, audio
+        self.index.setdefault('premixes', [])
         self.source_index = -1
         self.word_index = -1
         self.dirty = self.form_dirty = False
@@ -757,6 +1367,8 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
         self.loading = False
         self.statusBar().showMessage(str(self.path))
         self.refresh_experiment_words()
+        self.refresh_premix_list(0 if self.index['premixes'] else -1)
+        self.update_premix_buttons()
         self.update_title()
         if index['sources']:
             self.select_source(0)
@@ -1097,26 +1709,27 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
             self.status.setText('This index has no word recordings.')
             return
         path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
-            self, 'Export all words as video', 'mario_words.mov',
-            'MJPEG video (*.mov);;WebM video (*.webm)'
+            self, 'Export all words as video', 'mario_words.mp4',
+            'H.264 + Opus video (*.mp4);;WebM video (*.webm)'
         )
         if not path:
             return
         destination = Path(path)
-        if selected_filter.startswith('MJPEG'):
-            if destination.suffix.lower() != '.mov':
-                destination = destination.with_suffix('.mov')
-            container = 'mov'
+        if selected_filter.startswith('H.264'):
+            if destination.suffix.lower() != '.mp4':
+                destination = destination.with_suffix('.mp4')
+            container = 'mp4'
         else:
             if destination.suffix.lower() != '.webm':
                 destination = destination.with_suffix('.webm')
             container = 'webm'
+        progress = None
         try:
             from PIL import Image, ImageDraw, ImageFont
 
             ffmpeg = shutil.which('ffmpeg')
             if not ffmpeg:
-                raise RuntimeError('FFmpeg is required to export MJPEG MOV or WebM video.')
+                raise RuntimeError('FFmpeg is required to export H.264 + Opus MP4 or WebM video.')
             ffprobe = shutil.which('ffprobe')
             rate = self.index['sample_rate']
             items = []
@@ -1145,6 +1758,7 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
                     font_path = None
                 concat_lines = []
                 video_sources = {}
+                total_video_duration = 5.0
                 if ffprobe:
                     for source, _, _, _, _ in items:
                         if source.get('audio_only') or source['name'] in video_sources:
@@ -1155,8 +1769,16 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
                                 ffmpeg, ffprobe, clip_path, temp / f'video-{len(video_sources):05d}'
                             )
                 rendered_samples = []
+                export_color_cache = {}
+
+                @lru_cache(maxsize=48)
+                def load_background(path):
+                    with Image.open(path) as video_frame:
+                        return video_frame.convert('RGB')
+
                 for index, (source, record, chunk, word, variant) in enumerate(items):
                     if progress.wasCanceled():
+                        progress.close()
                         return
                     rendered_samples.append(chunk)
                     video_frames = video_sources.get(source['name'], [])
@@ -1169,24 +1791,34 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
                         duration = max(1, next_at - sample_at) / rate
                         image = Image.new('RGB', (480, 480), 'black')
                         if background is not None:
-                            with Image.open(background) as video_frame:
-                                image.paste(video_frame.convert('RGB').resize((480, 480), Image.Resampling.LANCZOS))
+                            image.paste(load_background(str(background)))
                         draw = ImageDraw.Draw(image)
                         word_bounds = (0, 0, 480, 240)
                         variant_bounds = (0, 240, 480, 480)
                         if background is None:
                             word_colors = variant_colors = ('white', 'black')
                         else:
-                            word_colors = self.export_text_colors(image, word_bounds)
-                            variant_colors = self.export_text_colors(image, variant_bounds)
+                            color_key = str(background)
+                            if (color_key, word_bounds) not in export_color_cache:
+                                export_color_cache[(color_key, word_bounds)] = self.export_text_colors(
+                                    image, word_bounds
+                                )
+                            if (color_key, variant_bounds) not in export_color_cache:
+                                export_color_cache[(color_key, variant_bounds)] = self.export_text_colors(
+                                    image, variant_bounds
+                                )
+                            word_colors = export_color_cache[(color_key, word_bounds)]
+                            variant_colors = export_color_cache[(color_key, variant_bounds)]
                         self.draw_export_text(draw, word, word_bounds, font_path, *word_colors)
                         self.draw_export_text(draw, str(variant), variant_bounds, font_path, *variant_colors)
                         frame = temp / f'frame-{index:08d}-{frame_index:06d}.png'
-                        image.save(frame)
+                        image.save(frame, compress_level=1)
                         concat_lines.extend((f"file '{frame.name}'", f'duration {duration:.9f}'))
+                        total_video_duration += duration
                     progress.setValue(index + 1)
                     QtWidgets.QApplication.processEvents()
                 if progress.wasCanceled():
+                    progress.close()
                     return
                 labels = [(word, variant) for _, _, _, word, variant in items]
                 summary = temp / 'summary.png'
@@ -1202,25 +1834,149 @@ class MixerIndexEditor(QtWidgets.QMainWindow):
                     output.setframerate(rate)
                     output.writeframes(b''.join(rendered_samples))
                 progress.setLabelText('Encoding variable-frame-rate video…')
-                progress.setRange(0, 0)
+                progress.setRange(0, 100)
+                progress.setValue(0)
                 QtWidgets.QApplication.processEvents()
-                command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
-                           '-f', 'concat', '-safe', '0', '-i', str(concat_path),
-                           '-i', str(audio_path), '-map', '0:v:0', '-map', '1:a:0',
-                           '-fps_mode', 'vfr']
-                if container == 'mov':
-                    command.extend(['-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj444p',
-                                    '-c:a', 'pcm_s16le', '-f', 'mov'])
+                encoder_probe = subprocess.run(
+                    [ffmpeg, '-hide_banner', '-encoders'],
+                    capture_output=True, text=True,
+                )
+                available_encoders = set()
+                for encoder_line in encoder_probe.stdout.splitlines():
+                    fields = encoder_line.split()
+                    if len(fields) >= 2 and len(fields[0]) == 6:
+                        available_encoders.add(fields[1])
+                if container == 'mp4':
+                    gpu_options = [
+                        ('NVIDIA NVENC', 'h264_nvenc',
+                         ['-c:v', 'h264_nvenc', '-preset', 'p1', '-rc', 'constqp',
+                          '-qp', '16', '-pix_fmt', 'yuv444p']),
+                        ('Intel Quick Sync', 'h264_qsv',
+                         ['-c:v', 'h264_qsv', '-preset', 'veryfast',
+                          '-global_quality', '16', '-pix_fmt', 'nv12']),
+                        ('AMD AMF', 'h264_amf',
+                         ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp',
+                          '-qp_i', '16', '-qp_p', '16', '-pix_fmt', 'nv12']),
+                        ('Apple VideoToolbox', 'h264_videotoolbox',
+                         ['-c:v', 'h264_videotoolbox', '-realtime', '1',
+                          '-q:v', '65', '-pix_fmt', 'yuv420p']),
+                    ]
+                    vaapi_devices = sorted(Path('/dev/dri').glob('renderD*'))
+                    if vaapi_devices:
+                        gpu_options.append((
+                            'VA-API', 'h264_vaapi',
+                            ['-init_hw_device', f'vaapi=va:{vaapi_devices[0]}',
+                             '-filter_hw_device', 'va', '-vf', 'format=nv12,hwupload',
+                             '-c:v', 'h264_vaapi', '-qp', '16', '-pix_fmt', 'nv12'],
+                        ))
+                    software_args = [
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '16',
+                        '-pix_fmt', 'yuv444p', '-color_range', 'pc',
+                    ]
+                    muxer_args = ['-c:a', 'libopus', '-b:a', '96k', '-f', 'mp4']
+                    extension = 'mp4'
                 else:
-                    command.extend(['-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0',
-                                    '-c:a', 'libopus', '-f', 'webm'])
-                command.append(str(destination))
-                result = subprocess.run(command, cwd=temp, capture_output=True, text=True)
-                if result.returncode:
-                    raise RuntimeError(result.stderr.strip() or 'FFmpeg could not encode the export.')
+                    gpu_options = [
+                        ('NVIDIA NVENC', 'vp9_nvenc',
+                         ['-c:v', 'vp9_nvenc', '-cq', '30', '-b:v', '0']),
+                        ('Intel Quick Sync', 'vp9_qsv',
+                         ['-c:v', 'vp9_qsv', '-global_quality', '30']),
+                    ]
+                    vaapi_devices = sorted(Path('/dev/dri').glob('renderD*'))
+                    if vaapi_devices:
+                        gpu_options.append((
+                            'VA-API', 'vp9_vaapi',
+                            ['-init_hw_device', f'vaapi=va:{vaapi_devices[0]}',
+                             '-filter_hw_device', 'va', '-vf', 'format=nv12,hwupload',
+                             '-c:v', 'vp9_vaapi', '-qp', '30'],
+                        ))
+                    software_args = [
+                        '-c:v', 'libvpx-vp9', '-deadline', 'realtime',
+                        '-cpu-used', '8', '-crf', '30', '-b:v', '0',
+                        '-row-mt', '1', '-tile-columns', '2',
+                    ]
+                    muxer_args = ['-c:a', 'libopus', '-f', 'webm']
+                    extension = 'webm'
+                candidates = [
+                    (label, options)
+                    for label, encoder, options in gpu_options
+                    if encoder in available_encoders
+                ]
+                candidates.append(('software', software_args))
+                encoded_path = temp / f'encoded.{extension}'
+                last_error = ''
+                for encoder_label, video_args in candidates:
+                    encoded_path.unlink(missing_ok=True)
+                    if encoder_label == 'software':
+                        progress.setLabelText('GPU encoding unavailable; using software…')
+                    else:
+                        progress.setLabelText(f'Encoding with {encoder_label}…')
+                    QtWidgets.QApplication.processEvents()
+                    command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostats',
+                               '-progress', 'pipe:1', '-stats_period', '0.1', '-y']
+                    if video_args and video_args[0] == '-init_hw_device':
+                        device_options = video_args[:4]
+                        video_args = video_args[4:]
+                        command.extend(device_options)
+                    else:
+                        device_options = []
+                    command.extend([
+                        '-f', 'concat', '-safe', '0', '-i', str(concat_path),
+                        '-i', str(audio_path), '-map', '0:v:0', '-map', '1:a:0',
+                        '-fps_mode', 'vfr', '-filter_threads', '0',
+                        '-filter_complex_threads', '0', '-threads', '0',
+                    ])
+                    command.extend(video_args)
+                    command.extend(muxer_args)
+                    command.append(str(encoded_path))
+                    result = subprocess.Popen(
+                        command, cwd=temp, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, encoding='utf-8',
+                        errors='replace', bufsize=1,
+                    )
+                    progress_values = {}
+                    canceled = False
+                    for line in result.stdout:
+                        if progress.wasCanceled():
+                            canceled = True
+                            result.terminate()
+                        if '=' not in line:
+                            continue
+                        key, value = line.rstrip().split('=', 1)
+                        progress_values[key] = value
+                        if key == 'progress':
+                            try:
+                                elapsed = int(progress_values.get('out_time_us', '0')) / 1_000_000
+                            except ValueError:
+                                elapsed = 0
+                            percent = min(99, round(
+                                elapsed / max(total_video_duration, 0.001) * 100
+                            ))
+                            progress.setValue(percent)
+                            QtWidgets.QApplication.processEvents()
+                            progress_values.clear()
+                            if canceled:
+                                break
+                    if canceled and result.poll() is None:
+                        result.kill()
+                    return_code = result.wait()
+                    error_text = result.stderr.read().strip()
+                    if canceled:
+                        progress.close()
+                        return
+                    if return_code == 0:
+                        break
+                    last_error = error_text or f'{encoder_label} could not encode the export.'
+                    encoded_path.unlink(missing_ok=True)
+                else:
+                    raise RuntimeError(last_error or 'FFmpeg could not encode the export.')
+                shutil.move(str(encoded_path), str(destination))
+                progress.setValue(100)
             progress.close()
             self.status.setText(f'Exported {len(items)} word variants to {destination}.')
         except Exception as exc:
+            if progress is not None:
+                progress.close()
             self.error(f'Cannot export word video: {exc}')
 
     def source_clip_path(self, source):

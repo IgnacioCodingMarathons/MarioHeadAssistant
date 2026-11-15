@@ -230,10 +230,10 @@ def main():
         unchanged = old_files.get(name) == source_files[name]
         parent = cached_index.get('duplicates', {}).get(name)
         parent_unchanged = parent in source_files and old_files.get(parent) == source_files[parent]
-        if cached_index.get('version') == VERSION and name in cached_sources and unchanged:
+        if cached_index.get('version', 0) >= 13 and name in cached_sources and unchanged:
             sources.append(reuse_source(cached_sources[name], old_blob, blob))
             print(f'Reused {name}', flush=True)
-        elif cached_index.get('version') == VERSION and unchanged and (parent is None or parent_unchanged):
+        elif cached_index.get('version', 0) >= 13 and unchanged and (parent is None or parent_unchanged):
             print(f'Reused skipped clip {name}', flush=True)
         else:
             pending.append(clip)
@@ -274,7 +274,7 @@ def main():
                     sources.append(source)
     sources, blob, duplicates = remove_duplicate_sources(sources, blob)
     retained_names = {source['name'] for source in sources}
-    previous_duplicates = cached_index.get('duplicates', {}) if cached_index.get('version') == VERSION else {}
+    previous_duplicates = cached_index.get('duplicates', {}) if cached_index.get('version', 0) >= 13 else {}
     for name, parent in previous_duplicates.items():
         if name not in retained_names and name in source_files and old_files.get(name) == source_files[name] and parent in source_files and old_files.get(parent) == source_files[parent]:
             duplicates[name] = duplicates.get(parent, parent)
@@ -289,6 +289,7 @@ def main():
         'sources': sources,
         'source_files': source_files,
         'duplicates': duplicates,
+        'premixes': cached_index.get('premixes', []),
     }
     write_model(output_path, index, blob)
     print(

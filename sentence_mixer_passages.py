@@ -84,6 +84,11 @@ def tokenize_variant_text(text, normalizer):
                         pending_length = 0.25
                 if custom:
                     options['custom_phones'] = custom
+            elif item.lower().startswith('premixpronunphoneme='):
+                value = item.split('=', 1)[1].strip().strip('[]')
+                premix_phones = [field.strip().upper() for field in value.split(',')]
+                if premix_phones and all(re.fullmatch(r'[A-Z]+', phone) for phone in premix_phones):
+                    options['premix_phones'] = premix_phones
             elif item.lower().startswith('pause='):
                 try:
                     pause = max(0, int(item.split('=', 1)[1].strip().strip('[]')))
@@ -182,6 +187,7 @@ class RecordedPassages:
         self.pronunciations = pronunciations
         self.starts = {}
         self.first_words = {}
+        self.first_words_without_phonemes = set()
         self.variants = {}
         self.recorded_phrases = {}
         self.cache = {}
@@ -199,7 +205,10 @@ class RecordedPassages:
                             (video, word.start, word.end)
                         )
                     else:
-                        self.first_words.setdefault(token, (video, word.start, word.end))
+                        if token not in self.first_words:
+                            self.first_words[token] = (video, word.start, word.end)
+                            if not word.phonems:
+                                self.first_words_without_phonemes.add(token)
                         self.variants.setdefault(token, []).append((video, word.start, word.end))
                         if word.phonems:
                             self.starts.setdefault(token, []).append((video, words, index))
@@ -214,7 +223,10 @@ class RecordedPassages:
                             )
                         else:
                             alias_token = alias_words[0]
-                            self.first_words.setdefault(alias_token, (video, word.start, word.end))
+                            if alias_token not in self.first_words:
+                                self.first_words[alias_token] = (video, word.start, word.end)
+                                if not word.phonems:
+                                    self.first_words_without_phonemes.add(alias_token)
                             self.variants.setdefault(alias_token, []).append(
                                 (video, word.start, word.end)
                             )
@@ -367,7 +379,13 @@ class RecordedPassages:
                 group.append(next_index)
             simultaneous_groups[index] = group
             index = group[-1] + 1
-        whole = self.match(words) if not pinned and not skip_recorded and not pauses and not silent_tokens and not simultaneous_groups else None
+        whole = None
+        if not pinned and not skip_recorded and not pauses and not silent_tokens and not simultaneous_groups:
+            exact_whole = self.recorded_phrases.get(tuple(words))
+            if exact_whole:
+                whole = exact_whole[0]
+            elif not any(word in self.first_words_without_phonemes for word in words):
+                whole = self.match(words)
         if whole is not None:
             return [(tokens, whole)]
         result = []
@@ -416,7 +434,15 @@ class RecordedPassages:
                 barrier = min((index for index in skip_recorded | set(pauses) | silent_tokens
                                if index > cursor), default=len(tokens))
                 remaining = [index for index in positions if cursor <= index < barrier] if cursor not in pinned else []
+                if (cursor not in pinned
+                        and tokens[cursor] in self.first_words_without_phonemes):
+                    found = (
+                        cursor + 1, [tokens[cursor]],
+                        self.first_words[tokens[cursor]],
+                    )
                 for count in range(min(len(remaining), self.maximum_words + 2), 1, -1):
+                    if found is not None:
+                        break
                     end = remaining[count - 1] + 1
                     if any(cursor <= index < end for index in pinned):
                         continue

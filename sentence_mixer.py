@@ -1,9 +1,11 @@
 import io
 import json
 import base64
+import hashlib
 import os
 import random
 import re
+import shutil
 import tempfile
 import threading
 import subprocess
@@ -13,11 +15,12 @@ import uuid
 import sys
 import atexit
 import traceback
+from functools import lru_cache
 from pathlib import Path
 
 from phoneme_dict import load_pronunciations, guess_pronunciation
 from sentence_mixer_sources import archive_needs_update, AUDIO_EXTENSIONS
-from sentence_mixer_binary import MODEL_NAME, VERSION, read_model
+from sentence_mixer_binary import MODEL_NAME, VERSION, premix_key, premix_lookup, read_model
 from sentence_mixer_silence import original_video_time
 from sentence_mixer_passages import ALL_VARIANTS, SIMULTANEOUS_TOKEN, RecordedPassages, SILENT_TOKEN, format_subtitle_text, tokenize_variant_text
 
@@ -29,6 +32,8 @@ PHONE_GROUPS = (
     ('CH', 'JH'), ('M', 'N', 'NG'), ('L', 'R'), ('W', 'Y', 'HH'),
 )
 VOWEL_PHONES = frozenset(phone for group in PHONE_GROUPS[:4] for phone in group)
+SENTENCE_TOKEN_PATTERN = re.compile(r"[a-z]+(?:'[a-z]+)*|\d+", re.IGNORECASE)
+SENTENCE_CACHE_VERSION = 1
 
 
 def adjust_speed_preserving_pitch(audio, target_ms, ffmpeg):
@@ -103,6 +108,84 @@ def normalize_numbers(text):
     return re.sub(r'(?<![\w.])[-+]?\d[\d,]*(?:\.\d+)?\b', replace_number, text)
 
 
+def indexed_pronunciations_from_index(index):
+    indexed = {}
+    for source in index.get('sources', []):
+        for record in source.get('words', []):
+            labels = [phone for phone, _, _ in record.get('phones', [])]
+            text = str(record.get('text', '')).lower()
+            if not re.search(r'\s', text) and labels:
+                word = re.sub(r'[^a-z]', '', text)
+                if word:
+                    indexed.setdefault(word, labels)
+    return indexed
+
+
+def indexed_variants_from_index(index):
+    indexed = {}
+    counts = {}
+    for source in index.get('sources', []):
+        for record in source.get('words', []):
+            candidates = [record.get('text', '')] + record.get('aliases', [])
+            for candidate in candidates:
+                candidate = str(candidate).lower()
+                if re.search(r'\s', candidate):
+                    continue
+                word = re.sub(r'[^a-z]', '', candidate)
+                if not word:
+                    continue
+                indexed.setdefault(word, counts.get(word, 0))
+                counts[word] = counts.get(word, 0) + 1
+    return indexed
+
+
+@lru_cache(maxsize=1)
+def _sentence_mixer_pronunciations():
+    return load_pronunciations()
+
+
+def phonemize_premix_sentence(sentence, indexed_pronunciations=None, indexed_variants=None):
+    indexed_pronunciations = indexed_pronunciations or {}
+    indexed_variants = indexed_variants or {}
+    pronunciations = _sentence_mixer_pronunciations()
+    text = re.sub(r'\\[^\\]*\\', ' ', str(sentence))
+    lines = []
+    for match in re.finditer(r"[a-z]+(?:'[a-z]+)*", text.lower()):
+        word = re.sub(r'[^a-z]', '', match.group())
+        if word in indexed_variants:
+            lines.append(str(indexed_variants[word]))
+            continue
+        entries = pronunciations.get(word)
+        phones = indexed_pronunciations.get(word) or (
+            entries[0] if entries else guess_pronunciation(word)
+        )
+        lines.append(' '.join(phones))
+    return '\n'.join(lines)
+
+
+def sentence_with_premix_phonemes(sentence, phoneme_text):
+    tag_spans = [match.span() for match in re.finditer(r'\\[^\\]*\\', sentence)]
+    words = [
+        match for match in re.finditer(r"[a-z]+(?:'[a-z]+)*", sentence, re.IGNORECASE)
+        if not any(start <= match.start() < end for start, end in tag_spans)
+    ]
+    groups = [line.strip().split() for line in phoneme_text.splitlines() if line.strip()]
+    if len(words) != len(groups):
+        raise ValueError('Premix phoneme count does not match its pronunciation sentence.')
+    parts = []
+    cursor = 0
+    for match, phones in zip(words, groups):
+        parts.append(sentence[cursor:match.start()])
+        if len(phones) == 1 and phones[0].isdigit():
+            parts.append(f"\\wvariant={phones[0]}\\")
+        else:
+            parts.append(f"\\premixpronunphoneme={','.join(phone.upper() for phone in phones)}\\")
+        parts.append(match.group())
+        cursor = match.end()
+    parts.append(sentence[cursor:])
+    return ''.join(parts)
+
+
 def enable_safe_sentence_search(audio_data):
     import sentence_mixing.logic.analyze as analyze
 
@@ -174,16 +257,19 @@ def enable_safe_sentence_search(audio_data):
 
 
 class LiveSentenceMixer:
-    def __init__(self, assets_dir, ffmpeg):
+    def __init__(self, assets_dir, ffmpeg, archive_path=None, trust_archive=False):
         self.assets_dir = assets_dir
-        self.archive_path = assets_dir / MODEL_NAME
+        self.archive_path = Path(archive_path) if archive_path else assets_dir / MODEL_NAME
         self.ffmpeg = ffmpeg
+        self.trust_archive = bool(trust_archive)
         self.enabled = False
         self.started = False
         self.ready = False
         self.load_done = threading.Event()
         self.lock = threading.Lock()
         self.videos = []
+        self.phonemized_patterns = {}
+        self.maximum_premix_words = 1
         self.audio_only_sources = set()
         self.source_time_maps = {}
         self.audio_filler_frames = None
@@ -192,6 +278,9 @@ class LiveSentenceMixer:
         self.indexed_pronunciations = {}
         self.fallback_words = set()
         self.temporary = tempfile.TemporaryDirectory(prefix='mario-sentence-mixing-')
+        self.cache_dir = Path(tempfile.gettempdir()) / 'marioassistant' / 'sentence-mixes'
+        self.cache_lock = threading.RLock()
+        self.cache_generation = 0
         self.worker_process = None
         self.worker_python = None
         atexit.register(self._stop_worker)
@@ -206,7 +295,11 @@ class LiveSentenceMixer:
         worker_python = self._find_free_threaded_python()
         if worker_python is not None:
             try:
-                self._prepare_archive_with_parent_python()
+                if self.trust_archive:
+                    if not self.archive_path.is_file():
+                        raise FileNotFoundError(self.archive_path)
+                else:
+                    self._prepare_archive_with_parent_python()
                 pronunciation_path = self._export_worker_pronunciations()
                 self._start_worker(worker_python, pronunciation_path)
                 self.ready = True
@@ -230,9 +323,106 @@ class LiveSentenceMixer:
             print('MarioAssistant TTS: preparing new or changed sentence-mixing clips before worker startup…', flush=True)
             subprocess.run(
                 [sys.executable, str(Path(__file__).with_name('prepare_sentence_mixer.py')),
-                 '--assets', str(self.assets_dir), '--ffmpeg', str(self.ffmpeg)],
+                 '--assets', str(self.assets_dir), '--ffmpeg', str(self.ffmpeg),
+                 '--output', str(self.archive_path)],
                 check=True,
             )
+        index, _ = read_model(self.archive_path)
+        self._set_phonemized_patterns([
+            entry for entry in index.get('premixes', [])
+            if entry.get('phonemes')
+        ])
+
+    def _set_phonemized_patterns(self, patterns):
+        self.phonemized_patterns = premix_lookup(patterns)
+        self.maximum_premix_words = max(
+            (len(SENTENCE_TOKEN_PATTERN.findall(key[2]))
+             for key in self.phonemized_patterns),
+            default=1,
+        )
+
+    def _sentence_cache_paths(self, text, with_video):
+        try:
+            archive = self.archive_path.resolve()
+            stat = archive.stat()
+            model_state = f'{archive}:{stat.st_size}:{stat.st_mtime_ns}'
+        except OSError:
+            model_state = str(self.archive_path)
+        payload = '\0'.join((
+            str(SENTENCE_CACHE_VERSION), str(VERSION), model_state,
+            'video' if with_video else 'audio', text,
+        )).encode('utf-8')
+        key = hashlib.sha256(payload).hexdigest()
+        base = self.cache_dir / key
+        return base.with_suffix('.json'), base.with_suffix('.wav'), base.with_suffix('.mp4')
+
+    def _load_sentence_cache(self, text, with_video):
+        metadata_path, audio_path, video_path = self._sentence_cache_paths(text, with_video)
+        with self.cache_lock:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+                audio_data = audio_path.read_bytes()
+                premixes_used = int(metadata.get('premixes_used', 0))
+                if with_video:
+                    if not video_path.is_file():
+                        return None
+                    result = {
+                        'audio': audio_data,
+                        'video': video_path,
+                        'text': metadata.get('text', ''),
+                        'phonemes': metadata.get('phonemes', ''),
+                        'premixes_used': premixes_used,
+                    }
+                else:
+                    result = audio_data
+                return result, premixes_used
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+
+    def clear_cache(self):
+        cache_root = self.cache_dir.parent
+        with self.cache_lock:
+            self.cache_generation += 1
+            if cache_root.is_symlink():
+                cache_root.unlink()
+            elif cache_root.exists():
+                shutil.rmtree(cache_root)
+            cache_root.mkdir(parents=True, exist_ok=True)
+
+    def _save_sentence_cache(self, text, with_video, result, premixes_used, generation):
+        metadata_path, audio_path, video_path = self._sentence_cache_paths(text, with_video)
+        audio_data = result.get('audio') if isinstance(result, dict) else result
+        if not isinstance(audio_data, (bytes, bytearray, memoryview)):
+            return
+        metadata = {
+            'premixes_used': int(premixes_used),
+            'text': result.get('text', '') if isinstance(result, dict) else '',
+            'phonemes': result.get('phonemes', '') if isinstance(result, dict) else '',
+        }
+        video_temp = None
+        with self.cache_lock:
+            if generation != self.cache_generation:
+                return
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            audio_temp = audio_path.with_name(f'.{audio_path.name}.{threading.get_ident()}.tmp')
+            metadata_temp = metadata_path.with_name(f'.{metadata_path.name}.{threading.get_ident()}.tmp')
+            try:
+                audio_temp.write_bytes(audio_data)
+                if with_video:
+                    source_video = result.get('video') if isinstance(result, dict) else None
+                    if source_video is None or not Path(source_video).is_file():
+                        return
+                    video_temp = video_path.with_name(f'.{video_path.name}.{threading.get_ident()}.tmp')
+                    shutil.copyfile(source_video, video_temp)
+                    os.replace(video_temp, video_path)
+                metadata_temp.write_text(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')
+                os.replace(audio_temp, audio_path)
+                os.replace(metadata_temp, metadata_path)
+            finally:
+                audio_temp.unlink(missing_ok=True)
+                metadata_temp.unlink(missing_ok=True)
+                if video_temp is not None:
+                    video_temp.unlink(missing_ok=True)
 
     def _export_worker_pronunciations(self):
         from phoneme_dict import load_pronunciations
@@ -269,9 +459,12 @@ class LiveSentenceMixer:
         self.worker_python = python
         environment = os.environ.copy()
         environment['MARIOASSISTANT_PRONUNCIATIONS_PATH'] = str(pronunciation_path)
+        command = [str(python), '-u', str(worker_script), '--assets', str(self.assets_dir),
+                   '--ffmpeg', str(self.ffmpeg), '--archive', str(self.archive_path)]
+        if self.trust_archive:
+            command.append('--trust-archive')
         self.worker_process = subprocess.Popen(
-            [str(python), '-u', str(worker_script), '--assets', str(self.assets_dir),
-             '--ffmpeg', str(self.ffmpeg)],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
             text=True, encoding='utf-8', bufsize=1, env=environment,
         )
@@ -324,22 +517,29 @@ class LiveSentenceMixer:
         media = result['media']
         return {'audio': base64.b64decode(media['audio']),
                 'video': Path(media['video']) if media.get('video') else None,
-                'text': media.get('text', '')} if with_video else base64.b64decode(media['audio'])
+                'text': media.get('text', ''),
+                'phonemes': media.get('phonemes', ''),
+                'premixes_used': int(media.get('premixes_used', 0))} if with_video else base64.b64decode(media['audio'])
 
     def _load_engine(self):
         try:
             needs_update = not self.archive_path.is_file()
-            if not needs_update:
+            if self.trust_archive and needs_update:
+                raise FileNotFoundError(self.archive_path)
+            if not self.trust_archive and not needs_update:
                 try:
                     index, _ = read_model(self.archive_path)
                     needs_update = index['version'] != VERSION or archive_needs_update(index, self.assets_dir)
                 except (OSError, ValueError):
                     needs_update = True
+            if self.trust_archive:
+                needs_update = False
             if needs_update:
                 print('MarioAssistant TTS: preparing new or changed sentence-mixing clips in the background…', flush=True)
                 subprocess.run(
                     [sys.executable, str(Path(__file__).with_name('prepare_sentence_mixer.py')),
-                     '--assets', str(self.assets_dir), '--ffmpeg', str(self.ffmpeg)],
+                 '--assets', str(self.assets_dir), '--ffmpeg', str(self.ffmpeg),
+                 '--output', str(self.archive_path)],
                     check=True,
                 )
             os.environ.setdefault('FFMPEG_BINARY', str(self.ffmpeg))
@@ -389,6 +589,10 @@ class LiveSentenceMixer:
             parameters.MAXIMAL_MINIMAL_PHONEM_LENGH_MALUS = 100
 
             index, blob = read_model(self.archive_path)
+            self._set_phonemized_patterns([
+                entry for entry in index.get('premixes', [])
+                if entry.get('phonemes')
+            ])
             self.pronunciations = load_pronunciations()
             self.indexed_pronunciations.clear()
             for source in index['sources']:
@@ -567,18 +771,112 @@ class LiveSentenceMixer:
         canvas = np.frombuffer(frames[destination], dtype=np.uint8).reshape(height, width, 3)
         canvas[:, left:right] = np.asarray(image)
 
-    def mix(self, text, with_video=False):
+    def mix(self, text, with_video=False, premix_count_callback=None, cache=True):
         if not self.enabled:
             return None
         self.load_done.wait()
-        if self.worker_process is not None:
-            with self.lock:
+        requested_text = text
+        with self.cache_lock:
+            cache_generation = self.cache_generation
+        cached = self._load_sentence_cache(requested_text, with_video) if cache else None
+        if cached is not None:
+            result, used_count = cached
+            if premix_count_callback is not None:
+                premix_count_callback(used_count)
+            return result
+        subtitle_override = None
+        word_spans = list(SENTENCE_TOKEN_PATTERN.finditer(text))
+        selected = []
+        cursor = 0
+        sensitivity_order = (
+            (True, True), (True, False), (False, True), (False, False),
+        )
+        while cursor < len(word_spans):
+            found = None
+            for end_index in range(
+                min(len(word_spans), cursor + self.maximum_premix_words), cursor, -1
+            ):
+                start = word_spans[cursor].start()
+                end = word_spans[end_index - 1].end()
+                candidate = text[start:end]
+                for case_sensitive, punctuation_sensitive in sensitivity_order:
+                    key = premix_key(candidate, case_sensitive, punctuation_sensitive)
+                    premix = self.phonemized_patterns.get(
+                        (case_sensitive, punctuation_sensitive, key)
+                    )
+                    if premix is not None:
+                        found = (cursor, end_index, start, end, premix,
+                                 case_sensitive, punctuation_sensitive)
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                cursor += 1
+            else:
+                selected.append(found)
+                cursor = found[1]
+
+        if selected:
+            parts = []
+            source_cursor = 0
+            used_count = 0
+            alternate_match = False
+            for _, _, start, end, premix, case_sensitive, punctuation_sensitive in selected:
+                matched_text = requested_text[start:end]
+                pronunciation = premix.get(
+                    'pronunciation_sentence', premix.get('sentence', '')
+                )
+                is_pronunciation_match = (
+                    premix_key(matched_text, case_sensitive, punctuation_sensitive)
+                    == premix_key(pronunciation, case_sensitive, punctuation_sensitive)
+                )
+                source_text = matched_text if is_pronunciation_match else pronunciation
                 try:
-                    return self._mix_in_worker(text, with_video)
-                except Exception as exc:
-                    print(f'MarioAssistant TTS: free-threaded worker failed: {type(exc).__name__}: {exc}', flush=True)
-                    return None
-        return self._mix_in_process(text, with_video)
+                    replacement = sentence_with_premix_phonemes(
+                        source_text, premix['phonemes']
+                    )
+                except ValueError as exc:
+                    print(f'MarioAssistant TTS: skipped invalid premix: {exc}', flush=True)
+                    replacement = matched_text
+                else:
+                    used_count += 1
+                    alternate_match = alternate_match or not is_pronunciation_match
+                parts.extend((requested_text[source_cursor:start], replacement))
+                source_cursor = end
+            parts.append(requested_text[source_cursor:])
+            text = ''.join(parts)
+            if alternate_match and with_video:
+                cleaned, _, _, options, _ = tokenize_variant_text(
+                    requested_text, normalize_numbers
+                )
+                subtitle_override = format_subtitle_text(
+                    cleaned, options, normalize_numbers
+                )
+        else:
+            used_count = 0
+        if premix_count_callback is not None:
+            premix_count_callback(used_count)
+        try:
+            if self.worker_process is not None:
+                with self.lock:
+                    result = self._mix_in_worker(text, with_video)
+            else:
+                result = self._mix_in_process(text, with_video)
+        except Exception as exc:
+            print(f'MarioAssistant TTS: free-threaded worker failed: {type(exc).__name__}: {exc}', flush=True)
+            return None
+        if isinstance(result, dict):
+            result['premixes_used'] = used_count
+        if subtitle_override is not None and isinstance(result, dict):
+            result['text'] = subtitle_override
+        if cache and result is not None:
+            try:
+                self._save_sentence_cache(
+                    requested_text, with_video, result, used_count, cache_generation
+                )
+            except OSError as exc:
+                print(f'MarioAssistant TTS: sentence cache save failed: {exc}', flush=True)
+        return result
 
     def _mix_in_process(self, text, with_video=False):
         if not self.enabled:
@@ -620,9 +918,11 @@ class LiveSentenceMixer:
                     indexed = self.indexed_pronunciations.get(token.lower())
                     entries = self.pronunciations.get(token.lower())
                     custom = options.get('custom_phones')
-                    if options.get('ignore_recorded') or custom:
+                    premix_phones = options.get('premix_phones')
+                    if options.get('ignore_recorded') or custom or premix_phones:
                         skip_recorded.add(token_index)
                     target_phones = ([phone for phone, _ in custom] if custom else
+                                     premix_phones if premix_phones else
                                      entries[0] if options.get('ignore_recorded') and entries else
                                      guess_pronunciation(token) if options.get('ignore_recorded') else
                                      indexed or (entries[0] if entries else guess_pronunciation(token)))
@@ -667,7 +967,10 @@ class LiveSentenceMixer:
                             raise RuntimeError(f"sentence-mixing returned no combination for {token}")
                         selected = complete_selected_phonemes(
                             combos[0], self.videos,
-                            prefer_recorded=not (options.get('ignore_recorded') or options.get('custom_phones')),
+                        prefer_recorded=not (
+                            options.get('ignore_recorded') or options.get('custom_phones')
+                            or options.get('premix_phones')
+                        ),
                         )
                         custom = options.get('custom_phones')
                         for phone_index, phone in enumerate(selected):
@@ -710,6 +1013,7 @@ class LiveSentenceMixer:
                     ignore_recorded = any(
                         word_options.get(position, {}).get('ignore_recorded')
                         or word_options.get(position, {}).get('custom_phones')
+                        or word_options.get(position, {}).get('premix_phones')
                         for position in range(token_cursor, token_cursor + len(part))
                     )
                     selected = complete_selected_phonemes(
