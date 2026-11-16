@@ -665,6 +665,7 @@ def create_connect_four_window(
     window.enable_player_turn = enable_player_turn
     window.cpu_turn = cpu_turn
     window.reset_game = reset_game
+    window.presence_stats = lambda: f'Moves: {cursor[0]}'
     window.set_preparing = set_preparing
     window.show_continue = show_continue
     refresh_board()

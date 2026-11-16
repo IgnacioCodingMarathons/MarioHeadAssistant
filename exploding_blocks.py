@@ -732,5 +732,6 @@ def create_exploding_blocks_window(QtCore, QtWidgets, on_close, play_clear_sound
     sound_timer.timeout.connect(play_next_sound)
     restart.clicked.connect(reset)
     window.reset_game = reset
+    window.presence_stats = lambda: f'Score: {score} - Stage: {stage} - Turn: {turn}'
     window.resize(740, 590)
     return window

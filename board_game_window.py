@@ -472,4 +472,5 @@ def create_board_game_window(
     QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Undo, window).activated.connect(undo.click)
     QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Redo, window).activated.connect(redo.click)
     window.reset_game = reset
+    window.presence_stats = lambda: f'Moves: {cursor}'
     return window

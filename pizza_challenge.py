@@ -815,4 +815,5 @@ def create_pizza_window(QtCore, QtWidgets, on_close, say, say_uncached, get_high
     clear_score.clicked.connect(clear_high_score)
     another.clicked.connect(lambda: reset())
     window.reset_game = reset
+    window.presence_stats = lambda: f'Score: {result_score}% - Difficulty: {difficulty.value()}'
     return window

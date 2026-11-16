@@ -29,6 +29,7 @@ DEFAULT_SETTINGS = {
     'finish_sensitivity': 5,
     'tts_live_sentence_mixing': False,
     'tts_subtitles': True,
+    'discord_rich_presence': False,
     'song_extra_folders': [],
     'weather_city': '',
     'weather_country_code': '',
@@ -63,6 +64,14 @@ def create_settings_window(
     tabs = QtWidgets.QTabWidget()
     layout.addWidget(tabs)
     controls = {}
+    discord_presence_available = False
+    if assets_dir is not None:
+        try:
+            discord_presence_available = bool(
+                (Path(assets_dir) / 'discord.richpresence').read_text(encoding='utf-8').strip()
+            )
+        except OSError:
+            discord_presence_available = False
 
     def add_scroll_tab(page, title):
         scroll = QtWidgets.QScrollArea()
@@ -76,7 +85,8 @@ def create_settings_window(
         ('Conversation', [('Chattiness', 'chattiness'), ('Playfulness', 'playfulness'),
                           ('Proactivity', 'proactivity')],
          [('Zen Mode', 'zen_mode'), ('Super Zen Mode', 'super_zen_mode'),
-          ('"Oh, sorry!"', 'oh_sorry'), ('Away mode', 'away_mode')]),
+          ('"Oh, sorry!"', 'oh_sorry'), ('Away mode', 'away_mode'),
+          ('Discord Rich Presence', 'discord_rich_presence')]),
         ('Movement', [('Wandering', 'wandering')],
          [('Use entropy for position', 'use_entropy_for_position')]),
         ('Pet Care', [('Caring Difficulty', 'caring_difficulty')], [('Autofeed', 'autofeed')]),
@@ -100,7 +110,11 @@ def create_settings_window(
         for label, name in checks:
             check = QtWidgets.QCheckBox(label)
             check.setObjectName(name)
-            check.setChecked(values[name])
+            if name == 'discord_rich_presence' and not discord_presence_available:
+                check.setChecked(False)
+                check.setEnabled(False)
+            else:
+                check.setChecked(values[name])
             check.toggled.connect(lambda value, field=name: changed(field, value))
             controls[name] = check
             form.addRow(check)

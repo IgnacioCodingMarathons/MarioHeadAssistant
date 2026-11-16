@@ -49,6 +49,7 @@ from weather_service import WeatherService, weather_failure_message
 from news_service import display_network_name, latest_news
 from pizza_challenge import ACTION as PIZZA_ACTION, TITLE as PIZZA_TITLE, create_pizza_window
 from exploding_blocks import ACTION as EXPLODING_BLOCKS_ACTION, TITLE as EXPLODING_BLOCKS_TITLE, create_exploding_blocks_window
+from discord_presence import DiscordPresence
 from backgammon import create_backgammon_window
 from checkers import create_checkers_window
 from chess_game import create_chess_window
@@ -1830,10 +1831,21 @@ def main() -> None:
         "speech_enable_wake_word",
         "autofeed",
         "away_mode",
+        "discord_rich_presence",
         "tts_live_sentence_mixing",
         "tts_subtitles",
     ):
         preferences[name] = bool(preferences[name])
+    discord_presence = DiscordPresence()
+    try:
+        discord_presence_available = bool(
+            (ASSETS / 'discord.richpresence').read_text(encoding='utf-8').strip()
+        )
+    except OSError:
+        discord_presence_available = False
+    if not discord_presence_available:
+        preferences['discord_rich_presence'] = False
+    discord_presence.set_enabled(preferences.get('discord_rich_presence', False))
     if preferences["wake_word_sensitivity"] == 0:
         preferences["speech_enable_wake_word"] = False
     pet = PetNeeds(
@@ -2965,6 +2977,34 @@ def main() -> None:
 
         running = True
         goodbye_running = False
+        discord_last_update = 0.0
+
+        def refresh_discord_presence(now):
+            nonlocal discord_last_update
+            if now - discord_last_update < 1.0:
+                return
+            discord_last_update = now
+            action = requested_action.get('name')
+            game_title = None
+            game_window = None
+            if action == 'connect4':
+                game_title = 'Connect-4'
+                game_window = connect4_window
+            elif action in BOARD_GAMES:
+                game_title = BOARD_GAMES[action][0]
+                game_window = board_game_windows.get(action)
+            elif action == PIZZA_ACTION:
+                game_title = PIZZA_TITLE
+                game_window = board_game_windows.get(PIZZA_ACTION)
+            elif action == EXPLODING_BLOCKS_ACTION:
+                game_title = EXPLODING_BLOCKS_TITLE
+                game_window = board_game_windows.get(EXPLODING_BLOCKS_ACTION)
+            if game_title and game_window is not None and game_window.isVisible():
+                stats = game_window.presence_stats() if hasattr(game_window, 'presence_stats') else 'In progress'
+                discord_presence.update_game(game_title, stats)
+            else:
+                discord_presence.update_idle()
+
         while running:
             try:
                 clock.tick(60)
@@ -2973,6 +3013,7 @@ def main() -> None:
                         and hasattr(debug_window, "_refresh_queue")):
                     debug_window._refresh_queue()
                 now = time.monotonic()
+                refresh_discord_presence(now)
                 while True:
                     try:
                         away_events.get_nowait()
@@ -3189,6 +3230,8 @@ def main() -> None:
                         sentence_mixer.set_enabled(value)
                     if name == "away_mode":
                         set_away_listener(value)
+                    if name == "discord_rich_presence":
+                        discord_presence.set_enabled(value)
                     if name == 'song_extra_folders':
                         preferences[name] = [
                             str(Path(folder).expanduser())
